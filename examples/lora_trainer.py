@@ -292,12 +292,17 @@ def create_splats_with_optimizers(
         params.append(("A", torch.nn.Parameter(torch.zeros(N, lora_rank)), lora_lr))
         B = torch.nn.Parameter(torch.zeros(lora_rank, K * d).to(device))
     else:
-        # features will be used for appearance and view-dependent shading
-        features = torch.rand(N, feature_dim)  # [N, feature_dim]
+        if lora_rank is None:
+            lora_rank = feature_dim  # default low rank
+    
+        features = torch.rand(N, feature_dim, device=device)
         params.append(("features", torch.nn.Parameter(features), sh0_lr))
-        colors = torch.logit(rgbs)  # [N, 3]
-        params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
-
+        base_colors = torch.logit(rgbs).to(device)
+        params.append(("colors", torch.nn.Parameter(base_colors), sh0_lr))    
+        params.append(("A", torch.nn.Parameter(torch.zeros(N, lora_rank, device=device)), lora_lr))
+        B = torch.nn.Parameter(
+            torch.zeros(lora_rank, feature_dim, device=device)
+        )
     
     def turn_off_grad(params: list[tuple[str, torch.nn.Parameter, float]], criteria: List[str]):
         for name, param, _ in params:
@@ -598,8 +603,10 @@ class Runner:
 
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:
+            features = self.splats["features"] 
+            features += (self.splats["A"] @ self.B)
             colors = self.app_module(
-                features=self.splats["features"],
+                features=features,
                 embed_ids=image_ids,
                 dirs=means[None, :, :] - camtoworlds[:, None, :3, 3],
                 sh_degree=kwargs.pop("sh_degree", self.cfg.sh_degree),
