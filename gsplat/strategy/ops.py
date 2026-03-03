@@ -160,6 +160,8 @@ def split(
         elif name == "opacities" and revised_opacity:
             new_opacities = 1.0 - torch.sqrt(1.0 - torch.sigmoid(p[sel]))
             p_split = torch.logit(new_opacities).repeat(repeats)  # [2N]
+        elif name == "lora_A":
+            p_split = p[sel].repeat(2, 1)   # [2N, r]
         else:
             p_split = p[sel].repeat(repeats)
         p_new = torch.cat([p[rest], p_split])

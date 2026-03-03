@@ -108,7 +108,15 @@ def main(local_rank: int, world_rank, world_size: int, args):
             scales.append(torch.exp(ckpt["scales"]))
             opacities.append(torch.sigmoid(ckpt["opacities"]))
             sh0.append(ckpt["sh0"])
-            shN.append(ckpt["shN"])
+            if "lora_A" in ckpt:
+                # LoRA checkpoint: reconstruct shN from the two factors
+                lora_A = ckpt["lora_A"]          # [N, r]
+                lora_B = ckpt_full["lora_B"]     # [r, K*3]
+                N_gs = lora_A.shape[0]
+                K = lora_B.shape[1] // 3         # number of higher-order SH coefficients
+                shN.append((lora_A @ lora_B).view(N_gs, K, 3))
+            else:
+                shN.append(ckpt["shN"])
         means = torch.cat(means, dim=0)
         quats = torch.cat(quats, dim=0)
         scales = torch.cat(scales, dim=0)

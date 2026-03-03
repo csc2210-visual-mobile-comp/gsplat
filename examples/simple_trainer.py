@@ -102,6 +102,10 @@ class Config:
     sh_degree: int = 3
     # Turn on another SH degree every this steps
     sh_degree_interval: int = 1000
+    # Use LoRA decomposition of higher-order SH coefficients instead of full shN
+    use_lora: bool = True
+    # Rank for LoRA decomposition of higher-order SH coefficients
+    lora_rank: int = 8
     # Initial opacity of GS
     init_opa: float = 0.1
     # Initial scale of GS
@@ -239,6 +243,8 @@ def create_splats_with_optimizers(
     shN_lr: float = 2.5e-3 / 20,
     scene_scale: float = 1.0,
     sh_degree: int = 3,
+    use_lora: bool = True,
+    lora_rank: int = 4,
     sparse_grad: bool = False,
     visible_adam: bool = False,
     batch_size: int = 1,
@@ -280,10 +286,15 @@ def create_splats_with_optimizers(
 
     if feature_dim is None:
         # color is SH coefficients.
-        colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
+        colors = torch.zeros(N, (sh_degree + 1) ** 2, 3)  # [N, K, 3]
         colors[:, 0, :] = rgb_to_sh(rgbs)
         params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
-        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
+        if use_lora:
+            # LoRA: replace shN with per-Gaussian factor lora_A; shared basis lora_B lives outside splats
+            params.append(("lora_A", torch.nn.Parameter(torch.randn(N, lora_rank) * 0.01), shN_lr))
+        else:
+            params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
+    
     else:
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
@@ -401,6 +412,8 @@ class Runner:
             shN_lr=cfg.shN_lr,
             scene_scale=self.scene_scale,
             sh_degree=cfg.sh_degree,
+            use_lora=cfg.use_lora,
+            lora_rank=cfg.lora_rank,
             sparse_grad=cfg.sparse_grad,
             visible_adam=cfg.visible_adam,
             batch_size=cfg.batch_size,
@@ -410,6 +423,20 @@ class Runner:
             world_size=world_size,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
+
+        # lora_B: shared color basis, not per-Gaussian — lives outside splats.
+        # Only applies when using SH (not app_opt) and use_lora=True.
+        if feature_dim is None and cfg.use_lora:
+            K = (cfg.sh_degree + 1) ** 2 - 1  # e.g. 15 for sh_degree=3
+            self.lora_B = torch.nn.Parameter(
+                torch.randn(cfg.lora_rank, K * 3, device=self.device) * 0.01
+            )
+            self.lora_B_optimizer = torch.optim.Adam(
+                [self.lora_B],
+                lr=cfg.shN_lr,
+                eps=1e-15,
+            )
+
 
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
@@ -584,8 +611,13 @@ class Runner:
             )
             colors = colors + self.splats["colors"]
             colors = torch.sigmoid(colors)
+        elif self.cfg.use_lora:
+            N = self.splats["lora_A"].shape[0]
+            K = (self.cfg.sh_degree + 1) ** 2 - 1
+            shN = (self.splats["lora_A"] @ self.lora_B).view(N, K, 3)  # [N, K, 3]
+            colors = torch.cat([self.splats["sh0"], shN], 1)  # [N, K+1, 3]
         else:
-            colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
+            colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K+1, 3]
 
         if rasterize_mode is None:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
@@ -904,6 +936,8 @@ class Runner:
                 ) as f:
                     json.dump(stats, f)
                 data = {"step": step, "splats": self.splats.state_dict()}
+                if not cfg.app_opt and cfg.use_lora:
+                    data["lora_B"] = self.lora_B
                 if cfg.pose_opt:
                     if world_size > 1:
                         data["pose_adjust"] = self.pose_adjust.module.state_dict()
@@ -935,6 +969,11 @@ class Runner:
                     rgb = torch.sigmoid(rgb).squeeze(0).unsqueeze(1)
                     sh0 = rgb_to_sh(rgb)
                     shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
+                elif self.cfg.use_lora:
+                    sh0 = self.splats["sh0"]
+                    N_gs = self.splats["lora_A"].shape[0]
+                    K_sh = (self.cfg.sh_degree + 1) ** 2 - 1
+                    shN = (self.splats["lora_A"] @ self.lora_B).view(N_gs, K_sh, 3).detach()
                 else:
                     sh0 = self.splats["sh0"]
                     shN = self.splats["shN"]
@@ -986,6 +1025,10 @@ class Runner:
                 else:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            if not cfg.app_opt and cfg.use_lora:
+                self.lora_B_optimizer.step()
+                self.lora_B_optimizer.zero_grad(set_to_none=True)
+
             for optimizer in self.pose_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
