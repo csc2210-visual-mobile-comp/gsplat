@@ -1,0 +1,66 @@
+  0%|          | 0/194 [00:00<?, ?it/s]100%|██████████| 194/194 [00:00<00:00, 117552.00it/s]
+Loading EXIF exposure:   0%|          | 0/194 [00:00<?, ?it/s]Loading EXIF exposure: 100%|██████████| 194/194 [00:00<00:00, 6421.00it/s]
+Traceback (most recent call last):
+  File "/workspace/gsplat/examples/lora_trainer.py", line 1474, in <module>
+    cli(main, cfg, verbose=True)
+  File "/workspace/gsplat/gsplat/distributed.py", line 360, in cli
+    return _distributed_worker(0, 1, fn=fn, args=args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/gsplat/gsplat/distributed.py", line 295, in _distributed_worker
+    fn(local_rank, world_rank, world_size, args)
+  File "/workspace/gsplat/examples/lora_trainer.py", line 1394, in main
+    runner = Runner(local_rank, world_rank, world_size, cfg)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/gsplat/examples/lora_trainer.py", line 409, in __init__
+    self.splats, self.optimizers, self.B, self.lora_optimizer = create_splats_with_optimizers(
+                                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/gsplat/examples/lora_trainer.py", line 330, in create_splats_with_optimizers
+    lora_optimizer = optimizer_class(
+                     ^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/optim/adam.py", line 102, in __init__
+    super().__init__(params, defaults)
+  File "/venv/main/lib/python3.12/site-packages/torch/optim/optimizer.py", line 408, in __init__
+    self.add_param_group(cast(dict, param_group))
+  File "/venv/main/lib/python3.12/site-packages/torch/_compile.py", line 54, in inner
+    return disable_fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/optim/optimizer.py", line 1151, in add_param_group
+    raise ValueError("can't optimize a non-leaf Tensor")
+ValueError: can't optimize a non-leaf Tensor
+  0%|          | 0/194 [00:00<?, ?it/s]100%|██████████| 194/194 [00:00<00:00, 118683.63it/s]
+Loading EXIF exposure:   0%|          | 0/194 [00:00<?, ?it/s]Loading EXIF exposure: 100%|██████████| 194/194 [00:00<00:00, 3544.65it/s]
+Traceback (most recent call last):
+  File "/workspace/gsplat/examples/lora_trainer.py", line 1474, in <module>
+    cli(main, cfg, verbose=True)
+  File "/workspace/gsplat/gsplat/distributed.py", line 360, in cli
+    return _distributed_worker(0, 1, fn=fn, args=args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/gsplat/gsplat/distributed.py", line 295, in _distributed_worker
+    fn(local_rank, world_rank, world_size, args)
+  File "/workspace/gsplat/examples/lora_trainer.py", line 1394, in main
+    runner = Runner(local_rank, world_rank, world_size, cfg)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/gsplat/examples/lora_trainer.py", line 409, in __init__
+    self.splats, self.optimizers, self.B, self.lora_optimizer = create_splats_with_optimizers(
+                                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/gsplat/examples/lora_trainer.py", line 330, in create_splats_with_optimizers
+    lora_optimizer = optimizer_class(
+                     ^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/optim/adam.py", line 102, in __init__
+    super().__init__(params, defaults)
+  File "/venv/main/lib/python3.12/site-packages/torch/optim/optimizer.py", line 408, in __init__
+    self.add_param_group(cast(dict, param_group))
+  File "/venv/main/lib/python3.12/site-packages/torch/_compile.py", line 54, in inner
+    return disable_fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/optim/optimizer.py", line 1151, in add_param_group
+    raise ValueError("can't optimize a non-leaf Tensor")
+ValueError: can't optimize a non-leaf Tensor
+cat: 'results/benchmark/lora/bicycle/stats/val*.json': No such file or directory
+cat: 'results/benchmark/lora/bicycle/stats/train*_rank0.json': No such file or directory

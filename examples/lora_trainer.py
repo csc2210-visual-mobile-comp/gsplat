@@ -248,7 +248,7 @@ def create_splats_with_optimizers(
     world_size: int = 1,
     lora_rank: Optional[int] = None,
     lora_lr: float = 2.5e-3
-) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer], torch.nn.ParameterDict]:
+) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer], torch.nn.Parameter, torch.optim.Optimizer]:
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
@@ -289,8 +289,8 @@ def create_splats_with_optimizers(
         colors[:, 0, :] = rgb_to_sh(rgbs)
         params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
         params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
-        params.append(("A", torch.nn.Parameter(torch.zeros_like(colors)).reshape(N, lora_rank), lora_lr))
-        params.append(("B", torch.nn.Parameter(torch.zeros_like(colors)).reshape(lora_rank, K * d), lora_lr))
+        params.append(("A", torch.nn.Parameter(torch.zeros(N, lora_rank)), lora_lr))
+        B = torch.nn.Parameter(torch.zeros(lora_rank, K * d).to(device))
     else:
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
@@ -298,17 +298,14 @@ def create_splats_with_optimizers(
         colors = torch.logit(rgbs)  # [N, 3]
         params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
 
-
-    def filter_params(params: list[tuple[str, torch.nn.Parameter, float]], criteria: List[str]):
-        return [(name, par, lr) for name, par, lr in params if name in criteria]
     
-    # This should be split and managed
-    splat_params = filter_params(params, ["means", "scales", "quats", "opacities", "sh0", "shN", "A", "features", "colors"])
-    optimizer_params = filter_params(params, ["means", "scales", "quats", "opacities", "A", "B"])
-    lora_params = filter_params(params, ["A", "B"])
+    def turn_off_grad(params: list[tuple[str, torch.nn.Parameter, float]], criteria: List[str]):
+        for name, param, _ in params:
+            if name in criteria:
+                param.requires_grad_(False)
 
-    splats = torch.nn.ParameterDict({n: v for n, v, _ in splat_params}).to(device)
-    lora_params = torch.nn.ParameterDict({n: v for n, v, _ in lora_params}).to(device)
+    turn_off_grad(params, ["sh0", "shN", "features", "colors"])
+    splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
     # Scale learning rate based on batch size, reference:
     # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
     # Note that this would not make the training exactly equivalent, see
@@ -323,15 +320,23 @@ def create_splats_with_optimizers(
         optimizer_class = torch.optim.Adam
     optimizers = {
         name: optimizer_class(
-            [{"params": param_item, "lr": lr * math.sqrt(BS), "name": name}],
+            [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
             eps=1e-15 / math.sqrt(BS),
             # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
             betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
             fused=True,
         )
-        for name, param_item, lr in optimizer_params
+        for name, p, lr in params if p.requires_grad
     }
-    return splats, optimizers, lora_params
+    lora_optimizer = optimizer_class(
+            [{"params": B, "lr": lora_lr * math.sqrt(BS), "name": "B"}],
+            eps=1e-15 / math.sqrt(BS),
+            # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
+            betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+            fused=True,
+    )
+
+    return splats, optimizers, B, lora_optimizer
 
 
 class Runner:
@@ -403,7 +408,7 @@ class Runner:
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
-        self.splats, self.optimizers, self.lora_params = create_splats_with_optimizers(
+        self.splats, self.optimizers, self.B, self.lora_optimizer = create_splats_with_optimizers(
             self.parser,
             init_type=cfg.init_type,
             init_num_pts=cfg.init_num_pts,
@@ -604,7 +609,7 @@ class Runner:
         else:
             colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
             N, K, d = colors.shape
-            colors += (self.lora_params["A"] @ self.lora_params("B")).view(N, K, d)
+            colors += (self.splats["A"] @ self.B).view(N, K, d)
 
         if rasterize_mode is None:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
@@ -1014,6 +1019,9 @@ class Runner:
             for optimizer in self.post_processing_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+
+            self.lora_optimizer.step()
+            self.lora_optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
                 scheduler.step()
 
