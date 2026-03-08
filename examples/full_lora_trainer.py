@@ -36,7 +36,7 @@ from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
-from gsplat.strategy import DefaultStrategy, MCMCStrategy, LoRAStrategy
+from gsplat.strategy import DefaultStrategy, MCMCStrategy, LoRAStrategy, LoRAStrategyAB
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
@@ -115,7 +115,7 @@ class Config:
     far_plane: float = 1e10
 
     # Strategy for GS densification
-    strategy: Union[DefaultStrategy, MCMCStrategy, LoRAStrategy] = field(
+    strategy: Union[DefaultStrategy, MCMCStrategy, LoRAStrategy, LoRAStrategyAB] = field(
         default_factory=LoRAStrategy
     )
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
@@ -207,7 +207,7 @@ class Config:
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
 
         strategy = self.strategy
-        if isinstance(strategy, DefaultStrategy) or isinstance(strategy, LoRAStrategy):
+        if isinstance(strategy, DefaultStrategy) or isinstance(strategy, LoRAStrategy) or isinstance(strategy, LoRAStrategyAB):
             strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
             strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
             strategy.reset_every = int(strategy.reset_every * factor)
@@ -443,7 +443,7 @@ class Runner:
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
 
-        if isinstance(self.cfg.strategy, DefaultStrategy) or isinstance(self.cfg.strategy, LoRAStrategy):
+        if isinstance(self.cfg.strategy, (DefaultStrategy, LoRAStrategy, LoRAStrategyAB)):
             self.strategy_state = self.cfg.strategy.initialize_state(
                 scene_scale=self.scene_scale
             )
@@ -1080,7 +1080,7 @@ class Runner:
                     lr=mcmc_lr,
                 )
             elif isinstance(self.cfg.strategy, LoRAStrategy):
-                self.cfg.strategy.step_post_backward(
+                kwargs = dict(
                     eff_params=lora_splats,
                     params=self.splats,
                     optimizers=self.optimizers,
@@ -1089,6 +1089,9 @@ class Runner:
                     info=info,
                     packed=cfg.packed,
                 )
+                if isinstance(self.cfg.strategy, LoRAStrategyAB):
+                    kwargs["B"] = self.B
+                self.cfg.strategy.step_post_backward(**kwargs)
             else:
                 assert_never(self.cfg.strategy)
 
@@ -1507,6 +1510,16 @@ if __name__ == "__main__":
                 opacity_reg=0.01,
                 scale_reg=0.01,
                 strategy=LoRAStrategy(verbose=True),
+            ),
+        ),
+        "lora_ab": (
+            "LoRA densification approximating DefaultStrategy.split via A and B.",
+            Config(
+                init_opa=0.5,
+                init_scale=0.1,
+                opacity_reg=0.01,
+                scale_reg=0.01,
+                strategy=LoRAStrategyAB(verbose=True),
             ),
         ),
     }

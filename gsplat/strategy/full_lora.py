@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 from typing_extensions import Literal
@@ -146,6 +146,155 @@ def split(
             repeats = [2] + [1] * (v.dim() - 1)
             v_new = v[sel].repeat(repeats)
             state[k] = torch.cat((v[rest], v_new))
+
+
+@torch.no_grad()
+def _split_eff_params_flat(
+    eff_params: Union[Dict[str, Tensor], torch.nn.ParameterDict],
+    mask: Tensor,
+    revised_opacity: bool = False,
+) -> Tensor:
+    """Apply DefaultStrategy-like split in *effective* parameter space.
+
+    Returns a flat tensor [2 * n_sel, D] with layout [means, quats, scales, opacities, rest].
+    Currently supports the SH-based color case (\"sh0\"/\"shN\" present in eff_params).
+    """
+    device = mask.device
+    sel = torch.where(mask)[0]
+    if len(sel) == 0:
+        return torch.empty(0, device=device)
+
+    # Geometry: follow the same rule as split(), but on eff_params instead of base params.
+    means = eff_params["means"][sel]
+    scales = torch.exp(eff_params["scales"][sel])
+    quats = F.normalize(eff_params["quats"][sel], dim=-1)
+    rotmats = normalized_quat_to_rotmat(quats)  # [N, 3, 3]
+    samples = torch.einsum(
+        "nij,nj,bnj->bni",
+        rotmats,
+        scales,
+        torch.randn(2, len(scales), 3, device=device),
+    )  # [2, N, 3]
+
+    means_split = (means + samples).reshape(-1, 3)  # [2N, 3]
+    scales_split = torch.log(scales / 1.6).repeat(2, 1)  # [2N, 3]
+
+    opacities = eff_params["opacities"][sel]
+    if revised_opacity:
+        new_opa = 1.0 - torch.sqrt(1.0 - torch.sigmoid(opacities))
+        opacities_split = torch.logit(new_opa).repeat(2)  # [2N]
+    else:
+        opacities_split = opacities.repeat(2)  # [2N]
+
+    quats_split = quats.repeat(2, 1)  # [2N, 4]
+
+    # Colors / SH rest
+    assert "sh0" in eff_params and "shN" in eff_params, (
+        "LoRAStrategyAB currently supports only SH-based colors (\"sh0\"/\"shN\" present "
+        "in eff_params)."
+    )
+    sh0 = eff_params["sh0"][sel]
+    shN = eff_params["shN"][sel]
+    rest = torch.cat([sh0, shN], dim=1).reshape(len(sel), -1).repeat(2, 1)
+
+    return torch.cat(
+        [
+            means_split,
+            quats_split,
+            scales_split,
+            opacities_split.unsqueeze(-1),
+            rest,
+        ],
+        dim=-1,
+    )
+
+
+@torch.no_grad()
+def split_approx_ab(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+    mask: Tensor,
+    eff_params: Union[Dict[str, Tensor], torch.nn.ParameterDict],
+    B: Tensor,
+    revised_opacity: bool = False,
+):
+    """Approximate DefaultStrategy split using LoRA only.
+
+    - Base params (means, scales, quats, opacities, SH) for selected GSs are *duplicated*
+      (no geometric jitter); parents are removed and replaced by two children with the
+      same base params.
+    - In effective space, we build E_split by applying the DefaultStrategy split rule
+      to eff_params.
+    - New A rows A' are chosen such that A' @ B ≈ (E_split - P'_base) in least squares,
+      where P'_base is the duplicated base (two children per parent).
+    """
+    device = mask.device
+    sel = torch.where(mask)[0]
+    rest = torch.where(~mask)[0]
+    n_split = len(sel)
+    if n_split == 0:
+        return
+
+    # Target effective params after split (in SH-based space).
+    split_eff_flat = _split_eff_params_flat(
+        eff_params, mask, revised_opacity=revised_opacity
+    )  # [2 * n_split, D]
+
+    # Base params for parents, flattened in the same layout used to construct B
+    means0 = params["means"][sel]
+    quats0 = params["quats"][sel]
+    scales0 = params["scales"][sel]
+    opacities0 = params["opacities"][sel]
+    assert "sh0" in params and "shN" in params, (
+        "LoRAStrategyAB currently supports only SH-based colors (\"sh0\"/\"shN\" present "
+        "in params)."
+    )
+    sh0_0 = params["sh0"][sel]
+    shN_0 = params["shN"][sel]
+    rest0 = torch.cat([sh0_0, shN_0], dim=1).reshape(len(sel), -1)
+    base_flat = torch.cat(
+        [means0, quats0, scales0, opacities0.unsqueeze(-1), rest0],
+        dim=-1,
+    )  # [n_split, D]
+    base_children_flat = base_flat.repeat(2, 1)  # [2 * n_split, D]
+
+    # Sanity check on dimensions against B
+    D = B.shape[1]
+    assert (
+        split_eff_flat.shape[1] == D and base_children_flat.shape[1] == D
+    ), f"Dimension mismatch for LoRAStrategyAB: split_eff_flat={split_eff_flat.shape}, base={base_children_flat.shape}, B={B.shape}"
+
+    # Solve A' in least squares sense: A' B ≈ (E_split - P'_base)
+    # B is [r, D]; pinv(B) is [D, r].
+    B_f = B.detach().to(dtype=torch.float32)
+    B_inv = torch.linalg.pinv(B_f)  # [D, r]
+    delta = (split_eff_flat - base_children_flat).to(dtype=torch.float32)  # [2N, D]
+    A_new_f = delta @ B_inv  # [2N, r]
+    A_new = A_new_f.to(dtype=params["A"].dtype, device=params["A"].device)
+
+    def param_fn(name: str, p: Tensor) -> Tensor:
+        reps = [2] + [1] * (p.dim() - 1)
+        if name == "A":
+            p_new = torch.cat([p[rest], A_new], dim=0)
+        else:
+            p_split = p[sel].repeat(reps)
+            p_new = torch.cat([p[rest], p_split], dim=0)
+        return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
+
+    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        v_split = torch.zeros((2 * n_split, *v.shape[1:]), device=device)
+        return torch.cat([v[rest], v_split], dim=0)
+
+    # Update params and optimizer states
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+
+    # Update running state: duplicate selected entries (like split() but without geometry change)
+    for k, v in state.items():
+        if isinstance(v, torch.Tensor):
+            reps = [2] + [1] * (v.dim() - 1)
+            v_new = v[sel].repeat(reps)
+            state[k] = torch.cat((v[rest], v_new), dim=0)
 
 
 @torch.no_grad()
@@ -542,3 +691,130 @@ class LoRAStrategy(Strategy):
             remove(params=params, optimizers=optimizers, state=state, mask=is_prune)
 
         return n_prune
+
+
+@dataclass
+class LoRAStrategyAB(LoRAStrategy):
+    """LoRA densification strategy that approximates DefaultStrategy.split via A only.
+
+    This strategy:
+    - Uses the same grow/prune heuristics as LoRAStrategy.
+    - For splitting, it *does not* change base params geometrically. Instead:
+        * Base params for selected GSs are duplicated (two children per parent).
+        * A' rows for the new children are chosen so that
+              A' @ B ≈ split(eff_params) - P'_base
+          in least squares, where P'_base are the duplicated base params.
+
+    Currently supports the SH-based color case (no appearance features).
+    """
+
+    def step_post_backward(
+        self,
+        eff_params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        optimizers: Dict[str, torch.optim.Optimizer],
+        state: Dict[str, Any],
+        step: int,
+        info: Dict[str, Any],
+        packed: bool = False,
+        B: Optional[Tensor] = None,
+    ):
+        """Same as LoRAStrategy.step_post_backward, but requires B for splitting."""
+        if step >= self.refine_stop_iter:
+            return
+
+        self._update_state(params, state, info, packed=packed)
+
+        if (
+            step > self.refine_start_iter
+            and step % self.refine_every == 0
+            and step % self.reset_every >= self.pause_refine_after_reset
+        ):
+            n_dupli, n_split = self._grow_gs(
+                eff_params, params, optimizers, state, step, B=B
+            )
+            if self.verbose:
+                print(
+                    f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
+                    f"Now having {len(params['means'])} GSs."
+                )
+
+            n_prune = self._prune_gs(eff_params, params, optimizers, state, step)
+            if self.verbose:
+                print(
+                    f"Step {step}: {n_prune} GSs pruned. "
+                    f"Now having {len(params['means'])} GSs."
+                )
+
+            state["grad2d"].zero_()
+            state["count"].zero_()
+            if self.refine_scale2d_stop_iter > 0:
+                state["radii"].zero_()
+            torch.cuda.empty_cache()
+
+        if step % self.reset_every == 0 and step > 0:
+            reset_opa(
+                params=params,
+                optimizers=optimizers,
+                state=state,
+                value=self.prune_opa * 2.0,
+            )
+
+    @torch.no_grad()
+    def _grow_gs(
+        self,
+        eff_params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        optimizers: Dict[str, torch.optim.Optimizer],
+        state: Dict[str, Any],
+        step: int,
+        B: Optional[Tensor] = None,
+    ) -> Tuple[int, int]:
+        if B is None:
+            raise ValueError(
+                "LoRAStrategyAB._grow_gs requires B (the shared LoRA matrix) to be passed."
+            )
+
+        count = state["count"]
+        grads = state["grad2d"] / count.clamp_min(1)
+        device = grads.device
+
+        is_grad_high = grads > self.grow_grad2d
+        is_small = (
+            torch.exp(eff_params["scales"]).max(dim=-1).values
+            <= self.grow_scale3d * state["scene_scale"]
+        )
+        is_dupli = is_grad_high & is_small
+        n_dupli = is_dupli.sum().item()
+
+        is_large = ~is_small
+        is_split = is_grad_high & is_large
+        if step < self.refine_scale2d_stop_iter:
+            is_split |= state["radii"] > self.grow_scale2d
+        n_split = is_split.sum().item()
+
+        # First duplicate small GSs as usual.
+        if n_dupli > 0:
+            duplicate(params=params, optimizers=optimizers, state=state, mask=is_dupli)
+
+        # New GSs added by duplication will not be split.
+        is_split = torch.cat(
+            [
+                is_split,
+                torch.zeros(n_dupli, dtype=torch.bool, device=device),
+            ]
+        )
+
+        # Then approximate split via A/B.
+        if n_split > 0:
+            split_approx_ab(
+                params=params,
+                optimizers=optimizers,
+                state=state,
+                mask=is_split,
+                eff_params=eff_params,
+                B=B,
+                revised_opacity=self.revised_opacity,
+            )
+
+        return n_dupli, n_split
