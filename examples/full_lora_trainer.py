@@ -585,11 +585,11 @@ class Runner:
     def _get_parameters(self, P):
         means = P[:, :3]
         quats = P[:, 3:7]
-        scales = torch.exp(P[:, 7:10])
-        opacities = torch.sigmoid(P[:, 10])
-        colors = P[:, 11:]
+        scales = P[:, 7:10]
+        opacities = P[:, 10]
+        rest = P[:, 11:]
 
-        return means, quats, scales, opacities, colors
+        return means, quats, scales, opacities, rest
 
     def rasterize_splats(
         self,
