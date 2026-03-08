@@ -647,11 +647,14 @@ class Runner:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
         if camera_model is None:
             camera_model = self.cfg.camera_model
+        # Rasterization expects scales in linear space and opacities in [0, 1]
+        scales_linear = torch.exp(scales)
+        opacities_linear = torch.sigmoid(opacities)
         render_colors, render_alphas, info = rasterization(
             means=means,
             quats=quats,
-            scales=scales,
-            opacities=opacities,
+            scales=scales_linear,
+            opacities=opacities_linear,
             colors=colors,
             viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
             Ks=Ks,  # [C, 3, 3]
@@ -1061,13 +1064,20 @@ class Runner:
                     packed=cfg.packed,
                 )
             elif isinstance(self.cfg.strategy, MCMCStrategy):
+                mcmc_lr = (
+                    schedulers[0].get_last_lr()[0]
+                    if schedulers
+                    else cfg.means_lr
+                    * self.scene_scale
+                    * math.sqrt(cfg.batch_size * self.world_size)
+                )
                 self.cfg.strategy.step_post_backward(
-                    params=lora_splats,
+                    params=self.splats,
                     optimizers=self.optimizers,
                     state=self.strategy_state,
                     step=step,
                     info=info,
-                    lr=schedulers[0].get_last_lr()[0],
+                    lr=mcmc_lr,
                 )
             elif isinstance(self.cfg.strategy, LoRAStrategy):
                 self.cfg.strategy.step_post_backward(
@@ -1077,7 +1087,7 @@ class Runner:
                     state=self.strategy_state,
                     step=step,
                     info=info,
-                    lr=schedulers[0].get_last_lr()[0],
+                    packed=cfg.packed,
                 )
             else:
                 assert_never(self.cfg.strategy)
@@ -1316,7 +1326,7 @@ class Runner:
         print("Running compression...")
         world_rank = self.world_rank
 
-        compress_dir = f"{cfg.result_dir}/compression/rank{world_rank}"
+        compress_dir = f"{self.cfg.result_dir}/compression/rank{world_rank}"
         os.makedirs(compress_dir, exist_ok=True)
 
         self.compression_method.compress(compress_dir, self.splats)
