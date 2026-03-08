@@ -199,6 +199,10 @@ class Config:
     with_ut: bool = False
     with_eval3d: bool = False
 
+    # First fraction of training as normal 3DGS (train base params); then LoRA only.
+    # 0.0 = LoRA from start (current behavior). 0.2 = first 20% full 3DGS, then LoRA.
+    lora_warmup_ratio: float = 0.2
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -247,7 +251,8 @@ def create_splats_with_optimizers(
     world_rank: int = 0,
     world_size: int = 1,
     lora_rank: Optional[int] = None,
-    lora_lr: float = 2.5e-3
+    lora_lr: float = 2.5e-3,
+    lora_warmup_ratio: float = 0.0,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer], torch.nn.Parameter, torch.optim.Optimizer]:
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
@@ -311,7 +316,11 @@ def create_splats_with_optimizers(
             if name not in criteria:
                 param.requires_grad_(False)
 
-    turn_on_grad(params, ["A"])
+    # Phase 1 (warmup): train all params with A lr=0. Phase 2: train A + B only.
+    if lora_warmup_ratio > 0:
+        turn_on_grad(params, [name for name, _, _ in params])
+    else:
+        turn_on_grad(params, ["A"])
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
     # Scale learning rate based on batch size, reference:
     # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
@@ -325,9 +334,17 @@ def create_splats_with_optimizers(
         optimizer_class = SelectiveAdam
     else:
         optimizer_class = torch.optim.Adam
+    # In warmup phase, A has lr=0 so it does not update until we switch to LoRA.
     optimizers = {
         name: optimizer_class(
-            [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
+            [
+                {
+                    "params": splats[name],
+                    "lr": (0.0 if name == "A" and lora_warmup_ratio > 0 else lr)
+                    * math.sqrt(BS),
+                    "name": name,
+                }
+            ],
             eps=1e-15 / math.sqrt(BS),
             # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
             betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
@@ -442,8 +459,23 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
+            lora_warmup_ratio=cfg.lora_warmup_ratio,
         )
+        self.lora_warmup_ratio = cfg.lora_warmup_ratio
+        self.lora_warmup_end_step = int(cfg.max_steps * cfg.lora_warmup_ratio)
+        self._lora_phase = (
+            False
+            if cfg.lora_warmup_ratio > 0
+            else True
+        )  # True = LoRA-only phase
+        self._lora_lr_scale = 2.5e-3 * math.sqrt(
+            cfg.batch_size * world_size
+        )  # A's lr when switching to LoRA
         print("Model initialized. Number of GS:", len(self.splats["means"]))
+        if cfg.lora_warmup_ratio > 0:
+            print(
+                f"LoRA warmup: first {self.lora_warmup_end_step} steps ({(100*cfg.lora_warmup_ratio):.0f}%) full 3DGS, then LoRA only."
+            )
 
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
@@ -798,6 +830,23 @@ class Runner:
                 self.viewer.lock.acquire()
                 tic = time.time()
 
+            # Switch from full 3DGS to LoRA-only at end of warmup
+            if (
+                self.lora_warmup_ratio > 0
+                and step == self.lora_warmup_end_step
+                and not self._lora_phase
+            ):
+                for name in self.splats:
+                    if name != "A":
+                        self.splats[name].requires_grad = False
+                self.splats["A"].requires_grad = True
+                self.optimizers["A"].param_groups[0]["lr"] = self._lora_lr_scale
+                self._lora_phase = True
+                if world_rank == 0:
+                    print(
+                        f"Step {step}: switching to LoRA-only phase (base params frozen, training A and B)."
+                    )
+
             # Freeze Gaussians when PPISP controller distillation starts
             if (
                 cfg.post_processing == "ppisp"
@@ -1040,13 +1089,26 @@ class Runner:
                 else:
                     visibility_mask = (info["radii"] > 0).all(-1).any(0)
 
-            # optimize
-            for optimizer in self.optimizers.values():
-                if cfg.visible_adam:
-                    optimizer.step(visibility_mask)
-                else:
-                    optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+            # optimize (phase 1 = full 3DGS base params + A with lr 0; phase 2 = A + B only)
+            if self.lora_warmup_ratio == 0 or self._lora_phase:
+                # LoRA phase or no warmup: step A and B only
+                if cfg.visible_adam and "A" in self.optimizers:
+                    self.optimizers["A"].step(visibility_mask)
+                elif "A" in self.optimizers:
+                    self.optimizers["A"].step()
+                if "A" in self.optimizers:
+                    self.optimizers["A"].zero_grad(set_to_none=True)
+                self.lora_optimizer.step()
+                self.lora_optimizer.zero_grad(set_to_none=True)
+            else:
+                # Warmup phase: step all base optimizers (A has lr=0 so unchanged)
+                for name, optimizer in self.optimizers.items():
+                    if cfg.visible_adam:
+                        optimizer.step(visibility_mask)
+                    else:
+                        optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                self.lora_optimizer.zero_grad(set_to_none=True)
             for optimizer in self.pose_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -1056,9 +1118,6 @@ class Runner:
             for optimizer in self.post_processing_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-
-            self.lora_optimizer.step()
-            self.lora_optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
                 scheduler.step()
 
