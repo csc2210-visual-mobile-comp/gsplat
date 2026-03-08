@@ -443,7 +443,7 @@ class Runner:
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
 
-        if isinstance(self.cfg.strategy, DefaultStrategy) and isinstance(self.cfg.strategy, LoRAStrategy):
+        if isinstance(self.cfg.strategy, DefaultStrategy) or isinstance(self.cfg.strategy, LoRAStrategy):
             self.strategy_state = self.cfg.strategy.initialize_state(
                 scene_scale=self.scene_scale
             )
@@ -605,7 +605,7 @@ class Runner:
         exposure: Optional[Tensor] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict, Dict]:
-        N, _ = self.splats["means"]
+        N, _ = self.splats["means"].shape
         P = torch.cat([self.splats["means"], self.splats["quats"], self.splats["scales"], self.splats["opacities"].view(-1, 1)], dim=-1) # [N, 11]
 
         image_ids = kwargs.pop("image_ids", None)
@@ -633,6 +633,7 @@ class Runner:
             N, K, d = colors.shape
             P_star = torch.cat([P, colors.view(N, K * d)], dim=-1) + (self.splats["A"] @ self.B)
             means, quats, scales, opacities, colors = self._get_parameters(P_star)
+            colors = colors.view(N, K, d)
             lora_splats = {
                 "means": means,
                 "scales": scales,
@@ -731,9 +732,9 @@ class Runner:
 
         schedulers = [
             # means has a learning rate schedule, that end at 0.01 of the initial value
-            torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
-            ),
+            # torch.optim.lr_scheduler.ExponentialLR(
+            #     self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
+            # ),
         ]
         if cfg.pose_opt:
             # pose optimization has a learning rate schedule
@@ -1057,9 +1058,9 @@ class Runner:
                 scheduler.step()
 
             # Run post-backward steps after backward and optimizer
-            if isinstance(self.cfg.strategy, DefaultStrategy) or isinstance(self.cfg.strategy, LoRAStrategy):
+            if isinstance(self.cfg.strategy, DefaultStrategy):
                 self.cfg.strategy.step_post_backward(
-                    params=self.lora_optimizer,
+                    params=lora_splats,
                     optimizers=self.optimizers,
                     state=self.strategy_state,
                     step=step,
@@ -1068,7 +1069,17 @@ class Runner:
                 )
             elif isinstance(self.cfg.strategy, MCMCStrategy):
                 self.cfg.strategy.step_post_backward(
-                    params=self.lora_optimizer,
+                    params=lora_splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                    lr=schedulers[0].get_last_lr()[0],
+                )
+            elif isinstance(self.cfg.strategy, LoRAStrategy):
+                self.cfg.strategy.step_post_backward(
+                    eff_params=lora_splats,
+                    params=self.splats,
                     optimizers=self.optimizers,
                     state=self.strategy_state,
                     step=step,
@@ -1126,7 +1137,7 @@ class Runner:
 
             torch.cuda.synchronize()
             tic = time.time()
-            colors, _, _ = self.rasterize_splats(
+            colors, _, _, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -1253,7 +1264,7 @@ class Runner:
             camtoworlds = camtoworlds_all[i : i + 1]
             Ks = K[None]
 
-            renders, _, _ = self.rasterize_splats(
+            renders, _, _, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -1346,7 +1357,7 @@ class Runner:
             "alpha": "RGB",
         }
 
-        render_colors, render_alphas, info = self.rasterize_splats(
+        render_colors, render_alphas, info, _ = self.rasterize_splats(
             camtoworlds=c2w[None],
             Ks=K[None],
             width=width,

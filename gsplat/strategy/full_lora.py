@@ -353,6 +353,7 @@ class LoRAStrategy(Strategy):
 
     def step_post_backward(
         self,
+        eff_params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
         params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
         optimizers: Dict[str, torch.optim.Optimizer],
         state: Dict[str, Any],
@@ -372,7 +373,7 @@ class LoRAStrategy(Strategy):
             and step % self.reset_every >= self.pause_refine_after_reset
         ):
             # grow GSs
-            n_dupli, n_split = self._grow_gs(params, optimizers, state, step)
+            n_dupli, n_split = self._grow_gs(eff_params, params, optimizers, state, step)
             if self.verbose:
                 print(
                     f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
@@ -380,7 +381,7 @@ class LoRAStrategy(Strategy):
                 )
 
             # prune GSs
-            n_prune = self._prune_gs(params, optimizers, state, step)
+            n_prune = self._prune_gs(eff_params, params, optimizers, state, step)
             if self.verbose:
                 print(
                     f"Step {step}: {n_prune} GSs pruned. "
@@ -464,6 +465,7 @@ class LoRAStrategy(Strategy):
     @torch.no_grad()
     def _grow_gs(
         self,
+        eff_params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
         params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
         optimizers: Dict[str, torch.optim.Optimizer],
         state: Dict[str, Any],
@@ -475,7 +477,7 @@ class LoRAStrategy(Strategy):
 
         is_grad_high = grads > self.grow_grad2d
         is_small = (
-            torch.exp(params["scales"]).max(dim=-1).values
+            torch.exp(eff_params["scales"]).max(dim=-1).values
             <= self.grow_scale3d * state["scene_scale"]
         )
         is_dupli = is_grad_high & is_small
@@ -513,15 +515,16 @@ class LoRAStrategy(Strategy):
     @torch.no_grad()
     def _prune_gs(
         self,
+        eff_params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
         params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
         optimizers: Dict[str, torch.optim.Optimizer],
         state: Dict[str, Any],
         step: int,
     ) -> int:
-        is_prune = torch.sigmoid(params["opacities"].flatten()) < self.prune_opa
+        is_prune = torch.sigmoid(eff_params["opacities"].flatten()) < self.prune_opa
         if step > self.reset_every:
             is_too_big = (
-                torch.exp(params["scales"]).max(dim=-1).values
+                torch.exp(eff_params["scales"]).max(dim=-1).values
                 > self.prune_scale3d * state["scene_scale"]
             )
             # The official code also implements sreen-size pruning but
