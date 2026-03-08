@@ -303,7 +303,7 @@ def create_splats_with_optimizers(
         params.append(("A", torch.nn.Parameter(torch.zeros(N, lora_rank, device=device)), lora_lr))
         # 3 means, 3 scales, 4 quats, 1 opacities
         B = torch.nn.Parameter(
-            torch.zeros(lora_rank, feature_dim + 11, device=device)
+            torch.zeros(lora_rank, feature_dim + 3 + 11, device=device)
         )
     
     def turn_on_grad(params: list[tuple[str, torch.nn.Parameter, float]], criteria: List[str]):
@@ -611,22 +611,22 @@ class Runner:
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:
             features = self.splats["features"] # [N, feature_dim]
-            P_star = torch.cat([P, features], dim=-1) + (self.splats["A"] @ self.B)
-            means, quats, scales, opacities, features = self._get_parameters(P_star)
-            colors = self.app_module(
-                features=features,
+            colors = self.splats["colors"] # [N, 3]
+            P_star = torch.cat([P, features, colors], dim=-1) + (self.splats["A"] @ self.B)
+            means, quats, scales, opacities, features_and_color = self._get_parameters(P_star)
+            rgb_logits = self.app_module(
+                features=features_and_color[:, :-3],
                 embed_ids=image_ids,
                 dirs=means[None, :, :] - camtoworlds[:, None, :3, 3],
                 sh_degree=kwargs.pop("sh_degree", self.cfg.sh_degree),
             )
-            colors = colors + self.splats["colors"]
-            colors = torch.sigmoid(colors)
+            rgb = torch.sigmoid(rgb_logits + features_and_color[:, -3:])
             lora_splats = {
                 "means": means,
                 "scales": scales,
                 "quats": quats,
                 "opacities": opacities,
-                "features": features
+                "colors": rgb
             }
         else:
             colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
@@ -981,14 +981,7 @@ class Runner:
 
                 if self.cfg.app_opt:
                     # eval at origin to bake the appeareance into the colors
-                    rgb = self.app_module(
-                        features=lora_splats["features"],
-                        embed_ids=None,
-                        dirs=torch.zeros_like(lora_splats["means"][None, :, :]),
-                        sh_degree=sh_degree_to_use,
-                    )
-                    rgb = rgb + lora_splats["colors"]
-                    rgb = torch.sigmoid(rgb).squeeze(0).unsqueeze(1)
+                    rgb = lora_splats["colors"].squeeze(0).unsqueeze(1)
                     sh0 = rgb_to_sh(rgb)
                     shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
                 else:
