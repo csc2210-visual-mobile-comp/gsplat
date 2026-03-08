@@ -1060,7 +1060,7 @@ class Runner:
             # Run post-backward steps after backward and optimizer
             if isinstance(self.cfg.strategy, DefaultStrategy):
                 self.cfg.strategy.step_post_backward(
-                    params=lora_splats,
+                    params=self.splats,
                     optimizers=self.optimizers,
                     state=self.strategy_state,
                     step=step,
