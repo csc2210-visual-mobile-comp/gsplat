@@ -412,6 +412,11 @@ class Runner:
             raise ValueError(
                 f"PPISP post-processing requires MCMCStrategy at the moment."
             )
+        if cfg.app_opt and isinstance(cfg.strategy, LoRAStrategyAB):
+            raise ValueError(
+                "LoRAStrategyAB does not support app_opt (appearance optimization). "
+                "Use LoRAStrategy or disable app_opt."
+            )
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
@@ -662,8 +667,10 @@ class Runner:
             height=height,
             packed=self.cfg.packed,
             absgrad=(
-                self.cfg.strategy.absgrad
-                if isinstance(self.cfg.strategy, DefaultStrategy)
+                getattr(self.cfg.strategy, "absgrad", False)
+                if isinstance(
+                    self.cfg.strategy, (DefaultStrategy, LoRAStrategy, LoRAStrategyAB)
+                )
                 else False
             ),
             sparse_grad=self.cfg.sparse_grad,
@@ -963,6 +970,8 @@ class Runner:
                 ) as f:
                     json.dump(stats, f)
                 data = {"step": step, "splats": self.splats.state_dict()}
+                if hasattr(self, "B") and self.B is not None:
+                    data["B"] = self.B.detach().cpu().clone()
                 if cfg.pose_opt:
                     if world_size > 1:
                         data["pose_adjust"] = self.pose_adjust.module.state_dict()
@@ -1332,12 +1341,26 @@ class Runner:
         compress_dir = f"{self.cfg.result_dir}/compression/rank{world_rank}"
         os.makedirs(compress_dir, exist_ok=True)
 
+        # Save LoRA B matrix so the compression directory is self-contained
+        if hasattr(self, "B") and self.B is not None:
+            torch.save(
+                {"B": self.B.detach().cpu().clone()},
+                os.path.join(compress_dir, "B.pt"),
+                weights_only=True,
+            )
+
         self.compression_method.compress(compress_dir, self.splats)
 
         # evaluate compression
         splats_c = self.compression_method.decompress(compress_dir)
         for k in splats_c.keys():
             self.splats[k].data = splats_c[k].to(self.device)
+        b_path = os.path.join(compress_dir, "B.pt")
+        if os.path.exists(b_path):
+            self.B.data = (
+                torch.load(b_path, map_location=self.device, weights_only=True)["B"]
+                .to(self.device)
+            )
         self.eval(step=step, stage="compress")
 
     @torch.no_grad()
@@ -1451,6 +1474,8 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         ]
         for k in runner.splats.keys():
             runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
+        if "B" in ckpts[0]:
+            runner.B.data = ckpts[0]["B"].to(runner.device)
         if runner.post_processing_module is not None:
             pp_state = ckpts[0].get("post_processing")
             if pp_state is not None:
