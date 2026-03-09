@@ -286,11 +286,12 @@ def create_splats_with_optimizers(
     ]
 
     if feature_dim is None:
-        if lora_rank is None:
-            lora_rank = (sh_degree + 1) ** 2 * 3
         # color is SH coefficients.
         colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
         N, K, d = colors.shape
+        # 3 means, 3 scales, 4 quats, 1 opacities
+        if lora_rank is None:
+            lora_rank = K * d + 11
         colors[:, 0, :] = rgb_to_sh(rgbs)
         params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
         params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
@@ -303,7 +304,7 @@ def create_splats_with_optimizers(
         B_colors = torch.nn.Parameter(torch.randn(lora_rank, K * d, device=device) * 1e-3)
     else:
         if lora_rank is None:
-            lora_rank = feature_dim  # default low rank
+            lora_rank = feature_dim + 3 + 11 # default low rank
     
         features = torch.rand(N, feature_dim, device=device)
         params.append(("features", torch.nn.Parameter(features), sh0_lr))
