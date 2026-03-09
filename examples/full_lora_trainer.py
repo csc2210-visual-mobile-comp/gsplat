@@ -489,6 +489,18 @@ class Runner:
         else:
             assert_never(self.cfg.strategy)
 
+        # During warmup use DefaultStrategy (same as simple_trainer) before switching to LoRA
+        self.warmup_strategy = None
+        self.warmup_strategy_state = None
+        if cfg.lora_warmup_ratio > 0 and isinstance(
+            self.cfg.strategy, (LoRAStrategy, LoRAStrategyAB)
+        ):
+            self.warmup_strategy = DefaultStrategy(verbose=True)
+            self.warmup_strategy.check_sanity(self.splats, self.optimizers)
+            self.warmup_strategy_state = self.warmup_strategy.initialize_state(
+                scene_scale=self.scene_scale
+            )
+
         # Compression Strategy
         self.compression_method = None
         if cfg.compression is not None:
@@ -778,6 +790,13 @@ class Runner:
             #     self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
             # ),
         ]
+        if cfg.lora_warmup_ratio > 0 and "means" in self.optimizers:
+            # During warmup match simple_trainer: use means LR schedule
+            schedulers.append(
+                torch.optim.lr_scheduler.ExponentialLR(
+                    self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
+                )
+            )
         if cfg.pose_opt:
             # pose optimization has a learning rate schedule
             schedulers.append(
@@ -909,14 +928,21 @@ class Runner:
             else:
                 colors, depths = renders, None
 
-            if cfg.random_bkgd:
-                bkgd = torch.rand(1, 3, device=device)
-                colors = colors + bkgd * (1.0 - alphas)
-
-            self.cfg.strategy.step_pre_backward(
+            # During warmup use DefaultStrategy (same as simple_trainer); after warmup use LoRA strategy
+            strategy = (
+                self.warmup_strategy
+                if (self.warmup_strategy is not None and not self._lora_phase)
+                else self.cfg.strategy
+            )
+            strategy_state = (
+                self.warmup_strategy_state
+                if (self.warmup_strategy is not None and not self._lora_phase)
+                else self.strategy_state
+            )
+            strategy.step_pre_backward(
                 params=self.splats,
                 optimizers=self.optimizers,
-                state=self.strategy_state,
+                state=strategy_state,
                 step=step,
                 info=info,
             )
@@ -1122,7 +1148,17 @@ class Runner:
                 scheduler.step()
 
             # Run post-backward steps after backward and optimizer
-            if isinstance(self.cfg.strategy, DefaultStrategy):
+            if self.warmup_strategy is not None and not self._lora_phase:
+                # Warmup: use DefaultStrategy (same as simple_trainer)
+                self.warmup_strategy.step_post_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.warmup_strategy_state,
+                    step=step,
+                    info=info,
+                    packed=cfg.packed,
+                )
+            elif isinstance(self.cfg.strategy, DefaultStrategy):
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
                     optimizers=self.optimizers,
