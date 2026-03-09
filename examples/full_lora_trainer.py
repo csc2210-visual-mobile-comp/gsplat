@@ -1625,20 +1625,12 @@ if __name__ == "__main__":
         "lora": (
             "Gaussian splatting training using densification from the paper '3D Gaussian Splatting as Markov Chain Monte Carlo'.",
             Config(
-                init_opa=0.5,
-                init_scale=0.1,
-                opacity_reg=0.01,
-                scale_reg=0.01,
                 strategy=LoRAStrategy(verbose=True),
             ),
         ),
         "lora_ab": (
             "LoRA densification approximating DefaultStrategy.split via A and B.",
             Config(
-                init_opa=0.5,
-                init_scale=0.1,
-                opacity_reg=0.01,
-                scale_reg=0.01,
                 strategy=LoRAStrategyAB(verbose=True),
             ),
         ),
