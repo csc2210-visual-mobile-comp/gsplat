@@ -251,7 +251,7 @@ def create_splats_with_optimizers(
     world_rank: int = 0,
     world_size: int = 1,
     lora_rank: Optional[int] = None,
-    lora_lr: float = 2.5e-3,
+    lora_lr: float = 2.5e-4,
     lora_warmup_ratio: float = 0.0,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer], torch.nn.Parameter, torch.optim.Optimizer]:
     if init_type == "sfm":
@@ -296,7 +296,11 @@ def create_splats_with_optimizers(
         params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
         params.append(("A", torch.nn.Parameter(torch.zeros(N, lora_rank)), lora_lr))
         # 3 means, 3 scales, 4 quats, 1 opacities
-        B = torch.nn.Parameter(torch.zeros(lora_rank, K * d + 11).to(device))
+        B_means = torch.nn.Parameter(torch.zeros(lora_rank, 3, device=device))
+        B_quats = torch.nn.Parameter(torch.zeros(lora_rank, 4, device=device))
+        B_scales = torch.nn.Parameter(torch.zeros(lora_rank, 3, device=device))
+        B_opacity = torch.nn.Parameter(torch.zeros(lora_rank, 1, device=device))
+        B_colors = torch.nn.Parameter(torch.zeros(lora_rank, K * d, device=device))
     else:
         if lora_rank is None:
             lora_rank = feature_dim  # default low rank
@@ -307,9 +311,13 @@ def create_splats_with_optimizers(
         params.append(("colors", torch.nn.Parameter(base_colors), sh0_lr))    
         params.append(("A", torch.nn.Parameter(torch.zeros(N, lora_rank, device=device)), lora_lr))
         # 3 means, 3 scales, 4 quats, 1 opacities
-        B = torch.nn.Parameter(
-            torch.zeros(lora_rank, feature_dim + 3 + 11, device=device)
-        )
+        B_means = torch.nn.Parameter(torch.zeros(lora_rank, 3, device=device))
+        B_quats = torch.nn.Parameter(torch.zeros(lora_rank, 4, device=device))
+        B_scales = torch.nn.Parameter(torch.zeros(lora_rank, 3, device=device))
+        B_opacity = torch.nn.Parameter(torch.zeros(lora_rank, 1, device=device))
+        B_colors = torch.nn.Parameter(torch.zeros(lora_rank, feature_dim + 3, device=device))
+
+    B = torch.cat([B_means, B_quats, B_scales, B_opacity, B_colors], dim=1)
     
     def turn_on_grad(params: list[tuple[str, torch.nn.Parameter, float]], criteria: List[str]):
         for name, param, _ in params:
@@ -352,12 +360,18 @@ def create_splats_with_optimizers(
         )
         for name, p, lr in params if p.requires_grad
     }
-    lora_optimizer = optimizer_class(
-            [{"params": B, "lr": lora_lr * math.sqrt(BS), "name": "B"}],
-            eps=1e-15 / math.sqrt(BS),
-            # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
-            betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
-            fused=True,
+
+    lora_optimizer = optimizer_class([
+            {"params": B_means,   "lr": 1e-4 * math.sqrt(BS)},
+            {"params": B_quats,    "lr": 1e-3 * math.sqrt(BS)},
+            {"params": B_scales,   "lr": 5e-3 * math.sqrt(BS)},
+            {"params": B_opacity, "lr": 5e-2 * math.sqrt(BS)},
+            {"params": B_colors,   "lr": 2.5e-3 * math.sqrt(BS)},
+        ],
+        eps=1e-15 / math.sqrt(BS),
+        # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
+        betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+        fused=True,
     )
 
     return splats, optimizers, B, lora_optimizer

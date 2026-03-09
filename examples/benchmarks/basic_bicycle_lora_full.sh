@@ -14,10 +14,11 @@ do
     echo "Running $SCENE"
 
     # train without eval
-    CUDA_VISIBLE_DEVICES=0 python full_lora_trainer.py default \
-        --max_steps 100 \
-        --eval_steps 50 100 \
-        --save_steps 100 \
+    CUDA_VISIBLE_DEVICES=0 python full_lora_trainer.py lora_ab \
+        --lora_warmup_ratio 0.5 \
+        --max_steps 4000 \
+        --eval_steps 2000 2500 4000 \
+        --save_steps 4000 \
         --disable_viewer \
         --data_factor $DATA_FACTOR \
         --render_traj_path $RENDER_TRAJ_PATH \
@@ -27,7 +28,10 @@ do
     # run eval and render
     for CKPT in $RESULT_DIR/$SCENE/ckpts/*;
     do
-        CUDA_VISIBLE_DEVICES=0 python full_lora_trainer.py default --disable_viewer --data_factor $DATA_FACTOR \
+        CUDA_VISIBLE_DEVICES=0 python full_lora_trainer.py lora_ab \
+            --lora_warmup_ratio 1 \
+            --disable_viewer \
+            --data_factor $DATA_FACTOR \
             --render_traj_path $RENDER_TRAJ_PATH \
             --data_dir data/360_v2/$SCENE/ \
             --result_dir $RESULT_DIR/$SCENE/ \

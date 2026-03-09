@@ -10,7 +10,8 @@ from torch import Tensor
 from typing import Callable, List
 import torch.nn.functional as F
 from gsplat.utils import normalized_quat_to_rotmat
-
+import os
+import json
 
 @torch.no_grad()
 def _update_param_with_optimizer(
@@ -208,6 +209,7 @@ def _split_eff_params_flat(
         dim=-1,
     )
 
+ctr = 0
 
 @torch.no_grad()
 def split_approx_ab(
@@ -280,6 +282,42 @@ def split_approx_ab(
     
     A_new_f = delta @ Bt @ inv                     # [2N, r]
     A_new = A_new_f.to(dtype=params["A"].dtype, device=params["A"].device)
+    recon = A_new_f @ B_f
+
+
+    if ctr % 100 == 0:
+        residual = recon - delta
+
+        means_err = torch.norm(residual[:, :3]) / torch.norm(delta[:, :3])
+        scale_err = torch.norm(residual[:, 7:10]) / torch.norm(delta[:, 7:10])
+        color_err = torch.norm(residual[:, 11:]) / torch.norm(delta[:, 11:])
+        recon = A_new_f @ B_f
+        residual = recon - delta
+
+        rel_error = torch.norm(residual) / (torch.norm(delta) + 1e-12)
+        r2 = 1.0 - (torch.norm(residual) ** 2) / (torch.norm(delta) ** 2 + 1e-12)
+
+        metrics = {
+            "num_split": int(n_split),
+            "relative_error": rel_error.item(),
+            "r2": r2.item(),
+            "means_err": means_err,
+            "scale_err": scale_err,
+            "color_err": color_err
+        }
+        path = "results/benchmark/lora/residual/residual.json"
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                data = json.load(f)
+        else:
+            data = []
+
+        data.append(metrics)
+
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+
+    ctr += 1
 
     def param_fn(name: str, p: Tensor) -> Tensor:
         reps = [2] + [1] * (p.dim() - 1)
