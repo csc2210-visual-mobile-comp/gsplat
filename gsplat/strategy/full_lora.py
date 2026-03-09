@@ -267,10 +267,18 @@ def split_approx_ab(
 
     # Solve A' in least squares sense: A' B ≈ (E_split - P'_base)
     # B is [r, D]; pinv(B) is [D, r].
-    B_f = B.detach().to(dtype=torch.float32)
-    B_inv = torch.linalg.pinv(B_f)  # [D, r]
+    B_f = B.detach().to(dtype=torch.float32)       # [r, D]
     delta = (split_eff_flat - base_children_flat).to(dtype=torch.float32)  # [2N, D]
-    A_new_f = delta @ B_inv  # [2N, r]
+    
+    Bt = B_f.T                                     # [D, r]
+    BBt = B_f @ Bt                                 # [r, r]
+    
+    lambda_reg = 1e-4
+    BBt_reg = BBt + lambda_reg * torch.eye(BBt.shape[0], device=B_f.device)
+    
+    inv = torch.linalg.inv(BBt_reg)
+    
+    A_new_f = delta @ Bt @ inv                     # [2N, r]
     A_new = A_new_f.to(dtype=params["A"].dtype, device=params["A"].device)
 
     def param_fn(name: str, p: Tensor) -> Tensor:
