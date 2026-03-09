@@ -209,8 +209,6 @@ def _split_eff_params_flat(
         dim=-1,
     )
 
-ctr = 0
-
 @torch.no_grad()
 def split_approx_ab(
     params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
@@ -219,6 +217,7 @@ def split_approx_ab(
     mask: Tensor,
     eff_params: Union[Dict[str, Tensor], torch.nn.ParameterDict],
     B: Tensor,
+    ctr: int,
     revised_opacity: bool = False,
 ):
     """Approximate DefaultStrategy split using LoRA only.
@@ -301,23 +300,15 @@ def split_approx_ab(
             "num_split": int(n_split),
             "relative_error": rel_error.item(),
             "r2": r2.item(),
-            "means_err": means_err,
-            "scale_err": scale_err,
-            "color_err": color_err
+            "means_err": means_err.item(),
+            "scale_err": scale_err.item(),
+            "color_err": color_err.item()
         }
-        path = "results/benchmark/lora/residual/residual.json"
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                data = json.load(f)
-        else:
-            data = []
-
-        data.append(metrics)
+        path = f"results/benchmark/lora/bicycle/residual/residual_{ctr}.json"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
 
         with open(path, "w") as f:
-            json.dump(data, f, indent=2)
-
-    ctr += 1
+            json.dump(metrics, f, indent=2)
 
     def param_fn(name: str, p: Tensor) -> Tensor:
         reps = [2] + [1] * (p.dim() - 1)
@@ -489,6 +480,7 @@ class LoRAStrategy(Strategy):
     revised_opacity: bool = False
     verbose: bool = False
     key_for_gradient: Literal["means2d", "gradient_2dgs"] = "means2d"
+    ctr: int = 0
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy.
@@ -806,6 +798,8 @@ class LoRAStrategyAB(LoRAStrategy):
                 value=self.prune_opa * 2.0,
             )
 
+        self.ctr += 1
+
     @torch.no_grad()
     def _grow_gs(
         self,
@@ -861,6 +855,7 @@ class LoRAStrategyAB(LoRAStrategy):
                 eff_params=eff_params,
                 B=B,
                 revised_opacity=self.revised_opacity,
+                ctr=self.ctr
             )
 
         return n_dupli, n_split

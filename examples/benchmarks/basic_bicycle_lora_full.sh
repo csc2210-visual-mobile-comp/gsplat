@@ -15,9 +15,9 @@ do
 
     # train without eval
     CUDA_VISIBLE_DEVICES=0 python full_lora_trainer.py lora_ab \
-        --lora_warmup_ratio 0.5 \
+        --lora_warmup_ratio 0.2 \
         --max_steps 4000 \
-        --eval_steps 2000 2500 4000 \
+        --eval_steps 800 2500 4000 \
         --save_steps 4000 \
         --disable_viewer \
         --data_factor $DATA_FACTOR \
@@ -29,7 +29,7 @@ do
     for CKPT in $RESULT_DIR/$SCENE/ckpts/*;
     do
         CUDA_VISIBLE_DEVICES=0 python full_lora_trainer.py lora_ab \
-            --lora_warmup_ratio 1 \
+            --lora_warmup_ratio 0.2 \
             --disable_viewer \
             --data_factor $DATA_FACTOR \
             --render_traj_path $RENDER_TRAJ_PATH \

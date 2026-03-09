@@ -294,13 +294,13 @@ def create_splats_with_optimizers(
         colors[:, 0, :] = rgb_to_sh(rgbs)
         params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
         params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
-        params.append(("A", torch.nn.Parameter(torch.zeros(N, lora_rank)), lora_lr))
+        params.append(("A", torch.nn.Parameter(torch.randn(N, lora_rank)) * 1e-3, lora_lr))
         # 3 means, 3 scales, 4 quats, 1 opacities
-        B_means = torch.nn.Parameter(torch.zeros(lora_rank, 3, device=device))
-        B_quats = torch.nn.Parameter(torch.zeros(lora_rank, 4, device=device))
-        B_scales = torch.nn.Parameter(torch.zeros(lora_rank, 3, device=device))
-        B_opacity = torch.nn.Parameter(torch.zeros(lora_rank, 1, device=device))
-        B_colors = torch.nn.Parameter(torch.zeros(lora_rank, K * d, device=device))
+        B_means = torch.nn.Parameter(torch.randn(lora_rank, 3, device=device) * 1e-3)
+        B_quats = torch.nn.Parameter(torch.randn(lora_rank, 4, device=device) * 1e-3)
+        B_scales = torch.nn.Parameter(torch.randn(lora_rank, 3, device=device) * 1e-3)
+        B_opacity = torch.nn.Parameter(torch.randn(lora_rank, 1, device=device) * 1e-3)
+        B_colors = torch.nn.Parameter(torch.randn(lora_rank, K * d, device=device) * 1e-3)
     else:
         if lora_rank is None:
             lora_rank = feature_dim  # default low rank
@@ -309,13 +309,13 @@ def create_splats_with_optimizers(
         params.append(("features", torch.nn.Parameter(features), sh0_lr))
         base_colors = torch.logit(rgbs).to(device)
         params.append(("colors", torch.nn.Parameter(base_colors), sh0_lr))    
-        params.append(("A", torch.nn.Parameter(torch.zeros(N, lora_rank, device=device)), lora_lr))
+        params.append(("A", torch.nn.Parameter(torch.randn(N, lora_rank, device=device)) * 1e-3, lora_lr))
         # 3 means, 3 scales, 4 quats, 1 opacities
-        B_means = torch.nn.Parameter(torch.zeros(lora_rank, 3, device=device))
-        B_quats = torch.nn.Parameter(torch.zeros(lora_rank, 4, device=device))
-        B_scales = torch.nn.Parameter(torch.zeros(lora_rank, 3, device=device))
-        B_opacity = torch.nn.Parameter(torch.zeros(lora_rank, 1, device=device))
-        B_colors = torch.nn.Parameter(torch.zeros(lora_rank, feature_dim + 3, device=device))
+        B_means = torch.nn.Parameter(torch.randn(lora_rank, 3, device=device) * 1e-3)
+        B_quats = torch.nn.Parameter(torch.randn(lora_rank, 4, device=device) * 1e-3)
+        B_scales = torch.nn.Parameter(torch.randn(lora_rank, 3, device=device) * 1e-3)
+        B_opacity = torch.nn.Parameter(torch.randn(lora_rank, 1, device=device) * 1e-3)
+        B_colors = torch.nn.Parameter(torch.randn(lora_rank, feature_dim + 3, device=device) * 1e-3)
 
     B = torch.cat([B_means, B_quats, B_scales, B_opacity, B_colors], dim=1)
     
@@ -362,11 +362,11 @@ def create_splats_with_optimizers(
     }
 
     lora_optimizer = optimizer_class([
-            {"params": B_means,   "lr": 1e-4 * math.sqrt(BS)},
-            {"params": B_quats,    "lr": 1e-3 * math.sqrt(BS)},
-            {"params": B_scales,   "lr": 5e-3 * math.sqrt(BS)},
-            {"params": B_opacity, "lr": 5e-2 * math.sqrt(BS)},
-            {"params": B_colors,   "lr": 2.5e-3 * math.sqrt(BS)},
+            {"params": B_means,   "lr":  lora_lr * math.sqrt(BS)},
+            {"params": B_quats,    "lr": lora_lr * math.sqrt(BS)},
+            {"params": B_scales,   "lr": lora_lr * math.sqrt(BS)},
+            {"params": B_opacity, "lr":  lora_lr * math.sqrt(BS)},
+            {"params": B_colors,   "lr": lora_lr * math.sqrt(BS)},
         ],
         eps=1e-15 / math.sqrt(BS),
         # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
@@ -675,7 +675,7 @@ class Runner:
         if self.cfg.app_opt:
             features = self.splats["features"] # [N, feature_dim]
             colors = self.splats["colors"] # [N, 3]
-            P_star = torch.cat([P, features, colors], dim=-1) + (self.splats["A"] @ self.B)
+            P_star = torch.cat([P, features, colors], dim=-1) + (self.splats["A"] @ self.B) if self._lora_phase else torch.cat([P, features, colors], dim=-1)
             means, quats, scales, opacities, features_and_color = self._get_parameters(P_star)
             rgb_logits = self.app_module(
                 features=features_and_color[:, :-3],
@@ -694,7 +694,7 @@ class Runner:
         else:
             colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
             N, K, d = colors.shape
-            P_star = torch.cat([P, colors.view(N, K * d)], dim=-1) + (self.splats["A"] @ self.B)
+            P_star = torch.cat([P, colors.view(N, K * d)], dim=-1) + (self.splats["A"] @ self.B) if self._lora_phase else torch.cat([P, colors.view(N, K * d)], dim=-1)
             means, quats, scales, opacities, colors = self._get_parameters(P_star)
             colors = colors.view(N, K, d)
             lora_splats = {
