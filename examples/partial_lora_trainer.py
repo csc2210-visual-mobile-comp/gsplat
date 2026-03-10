@@ -36,10 +36,100 @@ from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
-from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from gsplat.strategy import DefaultStrategy, MCMCStrategy, LoRATargetStrategyAB
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
+
+LoraTarget = Literal["colors", "opacity", "means", "scales", "quats", "features"]
+LoraLayout = List[Tuple[str, Tuple[int, ...]]]
+
+
+def normalize_lora_targets(targets: Optional[List[str]]) -> List[str]:
+    if targets is None:
+        targets = ["colors"]
+
+    aliases = {
+        "color": "colors",
+        "opacities": "opacity",
+    }
+    valid = {"colors", "opacity", "means", "scales", "quats", "features"}
+
+    out = []
+    seen = set()
+    for t in targets:
+        t = aliases.get(t, t)
+        if t not in valid:
+            raise ValueError(
+                f"Unknown LoRA target '{t}'. "
+                f"Valid values are: {sorted(valid)}"
+            )
+        if t not in seen:
+            out.append(t)
+            seen.add(t)
+    return out
+
+
+def iter_lora_named_tensors(
+    tensors: Union[Dict[str, Tensor], torch.nn.ParameterDict],
+    lora_targets: List[str],
+    app_opt: bool,
+):
+    """Yield the internal tensors that are LoRA-controlled, in pack order."""
+    for target in lora_targets:
+        if target == "means":
+            yield "means", tensors["means"]
+        elif target == "scales":
+            yield "scales", tensors["scales"]
+        elif target == "quats":
+            yield "quats", tensors["quats"]
+        elif target == "opacity":
+            yield "opacities", tensors["opacities"].unsqueeze(-1)
+        elif target == "colors":
+            if app_opt:
+                # app_opt=True uses the per-GS color logits tensor
+                yield "colors", tensors["colors"]
+            else:
+                # app_opt=False uses SH coefficients
+                yield "sh0", tensors["sh0"]
+                yield "shN", tensors["shN"]
+        elif target == "features":
+            if not app_opt:
+                raise ValueError("lora_target='features' requires app_opt=True")
+            yield "features", tensors["features"]
+        else:
+            raise ValueError(f"Unhandled LoRA target: {target}")
+
+
+def build_lora_layout(
+    tensors: Union[Dict[str, Tensor], torch.nn.ParameterDict],
+    lora_targets: List[str],
+    app_opt: bool,
+) -> LoraLayout:
+    layout: LoraLayout = []
+    for name, tensor in iter_lora_named_tensors(tensors, lora_targets, app_opt):
+        layout.append((name, tuple(tensor.shape[1:])))
+    return layout
+
+
+def lora_layout_dim(layout: LoraLayout) -> int:
+    return sum(math.prod(shape) for _, shape in layout)
+
+
+def unpack_lora_delta(delta: Tensor, layout: LoraLayout) -> Dict[str, Tensor]:
+    """Unpack [N, D] into named tensors according to layout."""
+    out: Dict[str, Tensor] = {}
+    offset = 0
+    N = delta.shape[0]
+    for name, shape in layout:
+        width = math.prod(shape)
+        out[name] = delta[:, offset : offset + width].reshape(N, *shape)
+        offset += width
+    if offset != delta.shape[1]:
+        raise ValueError(
+            f"LoRA delta width mismatch: consumed {offset}, got {delta.shape[1]}"
+        )
+    return out
 
 @dataclass
 class Config:
@@ -115,7 +205,7 @@ class Config:
     far_plane: float = 1e10
 
     # Strategy for GS densification
-    strategy: Union[DefaultStrategy, MCMCStrategy] = field(
+    strategy: Union[DefaultStrategy, MCMCStrategy, LoRATargetStrategyAB] = field(
         default_factory=DefaultStrategy
     )
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
@@ -199,6 +289,10 @@ class Config:
     with_ut: bool = False
     with_eval3d: bool = False
 
+    lora_rank: Optional[int] = None
+    lora_lr: float = 2.5e-3
+    lora_target: List[LoraTarget] = field(default_factory=lambda: ["colors"])
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -247,8 +341,15 @@ def create_splats_with_optimizers(
     world_rank: int = 0,
     world_size: int = 1,
     lora_rank: Optional[int] = None,
-    lora_lr: float = 2.5e-3
-) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer], torch.nn.Parameter, torch.optim.Optimizer]:
+    lora_lr: float = 2.5e-3,
+    lora_target: Optional[List[str]] = None,
+) -> Tuple[
+    torch.nn.ParameterDict,
+    Dict[str, torch.optim.Optimizer],
+    torch.nn.Parameter,
+    torch.optim.Optimizer,
+    LoraLayout,
+]:
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
@@ -258,90 +359,90 @@ def create_splats_with_optimizers(
     else:
         raise ValueError("Please specify a correct init_type: sfm or random")
 
-    # Initialize the GS size to be the average dist of the 3 nearest neighbors
-    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)
     dist_avg = torch.sqrt(dist2_avg)
-    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)
 
-    # Distribute the GSs to different ranks (also works for single rank)
     points = points[world_rank::world_size]
     rgbs = rgbs[world_rank::world_size]
     scales = scales[world_rank::world_size]
 
     N = points.shape[0]
-    quats = torch.rand((N, 4))  # [N, 4]
-    opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
+    quats = torch.rand((N, 4))
+    opacities = torch.logit(torch.full((N,), init_opacity))
 
     params = [
-        # name, value, lr
         ("means", torch.nn.Parameter(points), means_lr * scene_scale),
         ("scales", torch.nn.Parameter(scales), scales_lr),
         ("quats", torch.nn.Parameter(quats), quats_lr),
         ("opacities", torch.nn.Parameter(opacities), opacities_lr),
     ]
 
-    if feature_dim is None:
-        if lora_rank is None:
-            lora_rank = (sh_degree + 1) ** 2 * 3
-        # color is SH coefficients.
-        colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
-        N, K, d = colors.shape
+    app_opt = feature_dim is not None
+
+    if not app_opt:
+        colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))
         colors[:, 0, :] = rgb_to_sh(rgbs)
         params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
         params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
-        params.append(("A", torch.nn.Parameter(torch.zeros(N, lora_rank)), lora_lr))
-        B = torch.nn.Parameter(torch.zeros(lora_rank, K * d).to(device))
     else:
-        if lora_rank is None:
-            lora_rank = feature_dim  # default low rank
-    
-        features = torch.rand(N, feature_dim, device=device)
+        features = torch.rand(N, feature_dim)
+        base_colors = torch.logit(rgbs)
         params.append(("features", torch.nn.Parameter(features), sh0_lr))
-        base_colors = torch.logit(rgbs).to(device)
-        params.append(("colors", torch.nn.Parameter(base_colors), sh0_lr))    
-        params.append(("A", torch.nn.Parameter(torch.zeros(N, lora_rank, device=device)), lora_lr))
-        B = torch.nn.Parameter(
-            torch.zeros(lora_rank, feature_dim, device=device)
-        )
-    
-    def turn_off_grad(params: list[tuple[str, torch.nn.Parameter, float]], criteria: List[str]):
-        for name, param, _ in params:
-            if name in criteria:
-                param.requires_grad_(False)
+        params.append(("colors", torch.nn.Parameter(base_colors), sh0_lr))
 
-    turn_off_grad(params, ["sh0", "shN", "features", "colors"])
+    # Build LoRA layout from the base parameter tensors.
+    lora_target = normalize_lora_targets(lora_target)
+    base_param_dict = {name: value for name, value, _ in params}
+    lora_layout = build_lora_layout(base_param_dict, lora_target, app_opt=app_opt)
+    lora_dim = lora_layout_dim(lora_layout)
+    if lora_dim == 0:
+        raise ValueError("Empty LoRA target layout")
+
+    if lora_rank is None:
+        lora_rank = lora_dim
+
+    # Add LoRA A
+    params.append(("A", torch.nn.Parameter(torch.zeros(N, lora_rank)), lora_lr))
+    # Shared LoRA B
+    B = torch.nn.Parameter(torch.zeros(lora_rank, lora_dim, device=device))
+
+    # Freeze base tensors that are controlled by LoRA.
+    frozen_names = {name for name, _ in lora_layout}
+    for name, param, _ in params:
+        if name in frozen_names:
+            param.requires_grad_(False)
+
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
-    # Scale learning rate based on batch size, reference:
-    # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
-    # Note that this would not make the training exactly equivalent, see
-    # https://arxiv.org/pdf/2402.18824v1
+
     BS = batch_size * world_size
-    optimizer_class = None
     if sparse_grad:
         optimizer_class = torch.optim.SparseAdam
     elif visible_adam:
         optimizer_class = SelectiveAdam
     else:
         optimizer_class = torch.optim.Adam
+
+    # Keep optimizers for all splat params, even frozen ones.
+    # That makes densification / split / remove logic much easier to keep consistent.
     optimizers = {
         name: optimizer_class(
             [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
             eps=1e-15 / math.sqrt(BS),
-            # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
             betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
             fused=True,
         )
-        for name, p, lr in params if p.requires_grad
+        for name, _, lr in params
     }
+
     lora_optimizer = optimizer_class(
-            [{"params": B, "lr": lora_lr * math.sqrt(BS), "name": "B"}],
-            eps=1e-15 / math.sqrt(BS),
-            # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
-            betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
-            fused=True,
+        [{"params": B, "lr": lora_lr * math.sqrt(BS), "name": "B"}],
+        eps=1e-15 / math.sqrt(BS),
+        betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+        fused=True,
     )
 
-    return splats, optimizers, B, lora_optimizer
+    return splats, optimizers, B, lora_optimizer, lora_layout
 
 
 class Runner:
@@ -413,7 +514,14 @@ class Runner:
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
-        self.splats, self.optimizers, self.B, self.lora_optimizer = create_splats_with_optimizers(
+        self.lora_target = normalize_lora_targets(cfg.lora_target)
+        (
+            self.splats,
+            self.optimizers,
+            self.B,
+            self.lora_optimizer,
+            self.lora_layout,
+        ) = create_splats_with_optimizers(
             self.parser,
             init_type=cfg.init_type,
             init_num_pts=cfg.init_num_pts,
@@ -435,7 +543,11 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
+            lora_rank=cfg.lora_rank,
+            lora_lr=cfg.lora_lr,
+            lora_target=self.lora_target,
         )
+
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
         # Densification Strategy
@@ -565,6 +677,42 @@ class Runner:
         # Track if Gaussians are frozen (for controller distillation)
         self._gaussians_frozen = False
 
+    def _get_lora_delta_dict(self) -> Dict[str, Tensor]:
+        if len(self.lora_layout) == 0:
+            return {}
+        delta = self.splats["A"] @ self.B  # [N, D_lora]
+        return unpack_lora_delta(delta, self.lora_layout)
+
+
+    def _get_effective_splat_params(self) -> Dict[str, Tensor]:
+        delta = self._get_lora_delta_dict()
+
+        def add_delta(name: str, base: Tensor) -> Tensor:
+            if name not in delta:
+                return base
+            return base + delta[name]
+
+        eff: Dict[str, Tensor] = {
+            "means": add_delta("means", self.splats["means"]),
+            "scales": add_delta("scales", self.splats["scales"]),
+            "quats": add_delta("quats", self.splats["quats"]),
+            "opacities": (
+                self.splats["opacities"]
+                + delta["opacities"].squeeze(-1)
+                if "opacities" in delta
+                else self.splats["opacities"]
+            ),
+        }
+
+        if self.cfg.app_opt:
+            eff["features"] = add_delta("features", self.splats["features"])
+            eff["colors"] = add_delta("colors", self.splats["colors"])
+        else:
+            eff["sh0"] = add_delta("sh0", self.splats["sh0"])
+            eff["shN"] = add_delta("shN", self.splats["shN"])
+
+        return eff
+
     def freeze_gaussians(self):
         """Freeze all Gaussian parameters for controller distillation.
 
@@ -594,29 +742,26 @@ class Runner:
         exposure: Optional[Tensor] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
-        means = self.splats["means"]  # [N, 3]
-        # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
-        # rasterization does normalization internally
-        quats = self.splats["quats"]  # [N, 4]
-        scales = torch.exp(self.splats["scales"])  # [N, 3]
-        opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
+        eff = self._get_effective_splat_params()
+
+        means = eff["means"]
+        quats = eff["quats"]
+        scales = torch.exp(eff["scales"])
+        opacities = torch.sigmoid(eff["opacities"])
 
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:
-            features = self.splats["features"] 
-            features += (self.splats["A"] @ self.B)
+            features = eff["features"]
             colors = self.app_module(
                 features=features,
                 embed_ids=image_ids,
                 dirs=means[None, :, :] - camtoworlds[:, None, :3, 3],
                 sh_degree=kwargs.pop("sh_degree", self.cfg.sh_degree),
             )
-            colors = colors + self.splats["colors"]
+            colors = colors + eff["colors"]
             colors = torch.sigmoid(colors)
         else:
-            colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
-            N, K, d = colors.shape
-            colors += (self.splats["A"] @ self.B).view(N, K, d)
+            colors = torch.cat([eff["sh0"], eff["shN"]], 1)
 
         if rasterize_mode is None:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
@@ -633,11 +778,7 @@ class Runner:
             width=width,
             height=height,
             packed=self.cfg.packed,
-            absgrad=(
-                self.cfg.strategy.absgrad
-                if isinstance(self.cfg.strategy, DefaultStrategy)
-                else False
-            ),
+            absgrad=getattr(self.cfg.strategy, "absgrad", False),
             sparse_grad=self.cfg.sparse_grad,
             rasterize_mode=rasterize_mode,
             distributed=self.world_size > 1,
@@ -934,7 +1075,11 @@ class Runner:
                     "w",
                 ) as f:
                     json.dump(stats, f)
-                data = {"step": step, "splats": self.splats.state_dict()}
+                data = data = {
+                    "step": step,
+                    "splats": self.splats.state_dict(),
+                    "B": self.B.detach().cpu(),
+                }
                 if cfg.pose_opt:
                     if world_size > 1:
                         data["pose_adjust"] = self.pose_adjust.module.state_dict()
@@ -953,27 +1098,28 @@ class Runner:
             if (
                 step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
             ) and cfg.save_ply:
+                eff = self._get_effective_splat_params()
 
                 if self.cfg.app_opt:
-                    # eval at origin to bake the appeareance into the colors
                     rgb = self.app_module(
-                        features=self.splats["features"],
+                        features=eff["features"],
                         embed_ids=None,
-                        dirs=torch.zeros_like(self.splats["means"][None, :, :]),
+                        dirs=torch.zeros_like(eff["means"][None, :, :]),
                         sh_degree=sh_degree_to_use,
                     )
-                    rgb = rgb + self.splats["colors"]
+                    rgb = rgb + eff["colors"]
                     rgb = torch.sigmoid(rgb).squeeze(0).unsqueeze(1)
                     sh0 = rgb_to_sh(rgb)
                     shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
                 else:
-                    sh0 = self.splats["sh0"]
-                    shN = self.splats["shN"]
+                    sh0 = eff["sh0"]
+                    shN = eff["shN"]
 
-                means = self.splats["means"]
-                scales = self.splats["scales"]
-                quats = self.splats["quats"]
-                opacities = self.splats["opacities"]
+                means = eff["means"]
+                scales = eff["scales"]
+                quats = eff["quats"]
+                opacities = eff["opacities"]
+
                 export_splats(
                     means=means,
                     scales=scales,
@@ -1033,6 +1179,9 @@ class Runner:
                 scheduler.step()
 
             # Run post-backward steps after backward and optimizer
+            # Run post-backward steps after backward and optimizer
+            eff_params = self._get_effective_splat_params()
+
             if isinstance(self.cfg.strategy, DefaultStrategy):
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
@@ -1050,6 +1199,18 @@ class Runner:
                     step=step,
                     info=info,
                     lr=schedulers[0].get_last_lr()[0],
+                )
+            elif isinstance(self.cfg.strategy, LoRATargetStrategyAB):
+                self.cfg.strategy.step_post_backward(
+                    eff_params=eff_params,
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                    packed=cfg.packed,
+                    B=self.B,
+                    lora_layout=self.lora_layout,
                 )
             else:
                 assert_never(self.cfg.strategy)
@@ -1410,6 +1571,9 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         ]
         for k in runner.splats.keys():
             runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
+
+        if "B" in ckpts[0]:
+            runner.B.data.copy_(ckpts[0]["B"].to(runner.device))
         if runner.post_processing_module is not None:
             pp_state = ckpts[0].get("post_processing")
             if pp_state is not None:
@@ -1448,7 +1612,7 @@ if __name__ == "__main__":
         "default": (
             "Gaussian splatting training using densification heuristics from the original paper.",
             Config(
-                strategy=DefaultStrategy(verbose=True),
+                strategy=LoRATargetStrategyAB(verbose=True),
             ),
         ),
         "mcmc": (
