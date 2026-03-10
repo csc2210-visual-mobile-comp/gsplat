@@ -301,7 +301,7 @@ class Config:
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
 
         strategy = self.strategy
-        if isinstance(strategy, DefaultStrategy):
+        if isinstance(strategy, DefaultStrategy) or isinstance(strategy, LoRATargetStrategyAB):
             strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
             strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
             strategy.reset_every = int(strategy.reset_every * factor)
@@ -432,7 +432,7 @@ def create_splats_with_optimizers(
             betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
             fused=True,
         )
-        for name, _, lr in params
+        for name, param, lr in params if param.requires_grad
     }
 
     lora_optimizer = optimizer_class(
@@ -553,7 +553,7 @@ class Runner:
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
 
-        if isinstance(self.cfg.strategy, DefaultStrategy):
+        if isinstance(self.cfg.strategy, DefaultStrategy) or isinstance(self.cfg.strategy, LoRATargetStrategyAB):
             self.strategy_state = self.cfg.strategy.initialize_state(
                 scene_scale=self.scene_scale
             )
@@ -1612,7 +1612,7 @@ if __name__ == "__main__":
         "default": (
             "Gaussian splatting training using densification heuristics from the original paper.",
             Config(
-                strategy=LoRATargetStrategyAB(verbose=True),
+                strategy=DefaultStrategy(verbose=True),
             ),
         ),
         "mcmc": (
