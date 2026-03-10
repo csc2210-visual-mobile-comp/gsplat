@@ -11,7 +11,7 @@ RENDER_TRAJ_PATH="ellipse"
 CONFIG_NAME="default"
 
 # LoRA options
-LORA_TARGETS=(colors)
+LORA_TARGETS=(colors scales quats)
 LORA_RANK=16
 
 for SCENE in $SCENE_LIST; do
