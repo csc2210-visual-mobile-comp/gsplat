@@ -36,12 +36,12 @@ from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
-from gsplat.strategy import DefaultStrategy, MCMCStrategy, LoRATargetStrategyAB
+from gsplat.strategy import DefaultStrategy, MCMCStrategy, LoRAStrategy, LoRATargetStrategyAB
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
 
-LoraTarget = Literal["colors", "opacity", "means", "scales", "quats", "features"]
+LoraTarget = Literal["colors", "opacities", "means", "scales", "quats", "features"]
 LoraLayout = List[Tuple[str, Tuple[int, ...]]]
 
 
@@ -49,16 +49,11 @@ def normalize_lora_targets(targets: Optional[List[str]]) -> List[str]:
     if targets is None:
         targets = ["colors"]
 
-    aliases = {
-        "color": "colors",
-        "opacities": "opacity",
-    }
-    valid = {"colors", "opacity", "means", "scales", "quats", "features"}
+    valid = {"colors", "opacities", "means", "scales", "quats", "features"}
 
     out = []
     seen = set()
     for t in targets:
-        t = aliases.get(t, t)
         if t not in valid:
             raise ValueError(
                 f"Unknown LoRA target '{t}'. "
@@ -83,7 +78,7 @@ def iter_lora_named_tensors(
             yield "scales", tensors["scales"]
         elif target == "quats":
             yield "quats", tensors["quats"]
-        elif target == "opacity":
+        elif target == "opacities":
             yield "opacities", tensors["opacities"].unsqueeze(-1)
         elif target == "colors":
             if app_opt:
@@ -205,8 +200,10 @@ class Config:
     far_plane: float = 1e10
 
     # Strategy for GS densification
-    strategy: Union[DefaultStrategy, MCMCStrategy, LoRATargetStrategyAB] = field(
-        default_factory=DefaultStrategy
+    # Supports DefaultStrategy, LoRAStrategy (base split, LoRA-aware decisions),
+    # and LoRATargetStrategyAB (AB split in targeted subspace).
+    strategy: Union[DefaultStrategy, MCMCStrategy, LoRAStrategy, LoRATargetStrategyAB] = field(
+        default_factory=LoRAStrategy
     )
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
     packed: bool = False
@@ -301,7 +298,7 @@ class Config:
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
 
         strategy = self.strategy
-        if isinstance(strategy, DefaultStrategy) or isinstance(strategy, LoRATargetStrategyAB):
+        if isinstance(strategy, (DefaultStrategy, LoRAStrategy, LoRATargetStrategyAB)):
             strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
             strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
             strategy.reset_every = int(strategy.reset_every * factor)
@@ -553,7 +550,7 @@ class Runner:
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
 
-        if isinstance(self.cfg.strategy, DefaultStrategy) or isinstance(self.cfg.strategy, LoRATargetStrategyAB):
+        if isinstance(self.cfg.strategy, (DefaultStrategy, LoRAStrategy, LoRATargetStrategyAB)):
             self.strategy_state = self.cfg.strategy.initialize_state(
                 scene_scale=self.scene_scale
             )
@@ -846,12 +843,14 @@ class Runner:
         max_steps = cfg.max_steps
         init_step = 0
 
-        schedulers = [
-            # means has a learning rate schedule, that end at 0.01 of the initial value
-            torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
-            ),
-        ]
+        schedulers = []
+        if "means" in self.optimizers:
+            schedulers.append(
+                torch.optim.lr_scheduler.ExponentialLR(
+                    self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
+                )
+            )
+
         if cfg.pose_opt:
             # pose optimization has a learning rate schedule
             schedulers.append(
@@ -1014,11 +1013,20 @@ class Runner:
                 )
                 loss += post_processing_reg_loss
 
-            # regularizations
+            # regularizations (LoRA-aware: use effective params when targeted)
+            eff_for_reg = self._get_effective_splat_params()
             if cfg.opacity_reg > 0.0:
-                loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
+                if "opacities" in self.lora_target:
+                    opa_reg = torch.sigmoid(eff_for_reg["opacities"])
+                else:
+                    opa_reg = torch.sigmoid(self.splats["opacities"])
+                loss += cfg.opacity_reg * opa_reg.mean()
             if cfg.scale_reg > 0.0:
-                loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
+                if "scales" in self.lora_target:
+                    scale_reg = torch.exp(eff_for_reg["scales"])
+                else:
+                    scale_reg = torch.exp(self.splats["scales"])
+                loss += cfg.scale_reg * scale_reg.mean()
 
             loss.backward()
 
@@ -1179,7 +1187,6 @@ class Runner:
                 scheduler.step()
 
             # Run post-backward steps after backward and optimizer
-            # Run post-backward steps after backward and optimizer
             eff_params = self._get_effective_splat_params()
 
             if isinstance(self.cfg.strategy, DefaultStrategy):
@@ -1199,6 +1206,16 @@ class Runner:
                     step=step,
                     info=info,
                     lr=schedulers[0].get_last_lr()[0],
+                )
+            elif isinstance(self.cfg.strategy, LoRAStrategy):
+                self.cfg.strategy.step_post_backward(
+                    eff_params=eff_params,
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                    packed=cfg.packed,
                 )
             elif isinstance(self.cfg.strategy, LoRATargetStrategyAB):
                 self.cfg.strategy.step_post_backward(
@@ -1610,9 +1627,9 @@ if __name__ == "__main__":
     # Each is a tuple of (CLI description, config object).
     configs = {
         "default": (
-            "Gaussian splatting training using densification heuristics from the original paper.",
+            "Partial-LoRA Gaussian splatting with LoRA-aware densification (LoRAStrategy).",
             Config(
-                strategy=DefaultStrategy(verbose=True),
+                strategy=LoRAStrategy(verbose=True),
             ),
         ),
         "mcmc": (

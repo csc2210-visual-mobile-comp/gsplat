@@ -226,11 +226,13 @@ def split_approx_ab(
     revised_opacity: bool = False,
     reg_lambda: float = 1e-4,
 ):
-    """Approximate DefaultStrategy split in LoRA space only.
+    """Approximate DefaultStrategy split, respecting partial LoRA targeting.
 
-    Base params are duplicated, and new A rows are solved so that:
+    Non-LoRA-targeted parameters are split in base space exactly like the
+    DefaultStrategy split rule. LoRA-targeted parameters keep their base
+    duplicated, and new A rows are solved so that:
 
-        A_new @ B ~= split(eff_params)[lora_targets] - duplicated_base[lora_targets]
+        A_new @ B ≈ split(P_eff)[targets] - P_base_children[targets]
     """
     device = mask.device
     sel = torch.where(mask)[0]
@@ -245,36 +247,67 @@ def split_approx_ab(
         mask=mask,
         lora_layout=lora_layout,
         revised_opacity=revised_opacity,
-    )  # [2 * n_split, D]
+    )  # [2 * n_split, D_lora]
 
     # Duplicated base values in the same subspace.
-    base_flat = _pack_lora_layout(params, lora_layout, indices=sel)  # [n_split, D]
-    base_children_flat = base_flat.repeat(2, 1)  # [2 * n_split, D]
+    base_flat = _pack_lora_layout(params, lora_layout, indices=sel)  # [n_split, D_lora]
+    base_children_flat = base_flat.repeat(2, 1)  # [2 * n_split, D_lora]
 
-    D = B.shape[1]
-    if split_eff_flat.shape[1] != D:
+    D_lora = B.shape[1]
+    if split_eff_flat.shape[1] != D_lora:
         raise ValueError(
-            f"LoRA layout width ({split_eff_flat.shape[1]}) does not match B width ({D})."
+            f"LoRA layout width ({split_eff_flat.shape[1]}) does not match B width ({D_lora})."
         )
 
-    # Solve A_new in least squares sense:
-    #   A_new B ~= delta
-    # where B is [r, D], delta is [2N, D], A_new is [2N, r]
-    Bf = B.detach().to(dtype=torch.float32)  # [r, D]
-    delta = (split_eff_flat - base_children_flat).to(dtype=torch.float32)  # [2N, D]
+    # Solve A_new in least squares sense within the LoRA-targeted subspace.
+    #   A_new B ≈ delta
+    # where B is [r, D_lora], delta is [2N, D_lora], A_new is [2N, r].
+    Bf = B.detach().to(dtype=torch.float32)  # [r, D_lora]
+    delta = (split_eff_flat - base_children_flat).to(
+        dtype=torch.float32
+    )  # [2N, D_lora]
 
-    Bt = Bf.T  # [D, r]
+    Bt = Bf.T  # [D_lora, r]
     BBt = Bf @ Bt  # [r, r]
     BBt_reg = BBt + reg_lambda * torch.eye(BBt.shape[0], device=Bf.device)
     inv = torch.linalg.inv(BBt_reg)
     A_new = (delta @ Bt @ inv).to(dtype=params["A"].dtype, device=params["A"].device)
 
+    # Names that are LoRA-controlled; these keep their base duplicated.
+    lora_target_names = {name for name, _ in lora_layout}
+    frozen_names = lora_target_names | {"A"}
+
     def param_fn(name: str, p: Tensor) -> torch.nn.Parameter:
         reps = [2] + [1] * (p.dim() - 1)
         if name == "A":
+            # Parents are replaced by children with newly solved A rows.
             p_new = torch.cat([p[rest], A_new], dim=0)
-        else:
+        elif name in frozen_names:
+            # LoRA-targeted base params: duplicate only, do not apply geometric split.
             p_split = p[sel].repeat(reps)
+            p_new = torch.cat([p[rest], p_split], dim=0)
+        else:
+            # Non-LoRA-targeted params: perform normal DefaultStrategy-style split.
+            if name == "means":
+                scales_lin = torch.exp(eff_params["scales"][sel])  # [N, 3]
+                quats_norm = F.normalize(eff_params["quats"][sel], dim=-1)  # [N, 4]
+                rotmats = normalized_quat_to_rotmat(quats_norm)  # [N, 3, 3]
+                samples = torch.einsum(
+                    "nij,nj,bnj->bni",
+                    rotmats,
+                    scales_lin,
+                    torch.randn(2, n_split, 3, device=device),
+                )  # [2, N, 3]
+                p_split = (p[sel] + samples).reshape(2 * n_split, 3)
+            elif name == "scales":
+                scales_lin = torch.exp(eff_params["scales"][sel])  # [N, 3]
+                p_split = torch.log(scales_lin / 1.6).repeat(2, 1)  # [2N, 3]
+            elif name == "opacities" and revised_opacity:
+                opa = p[sel]
+                new_opa = 1.0 - torch.sqrt(1.0 - torch.sigmoid(opa))
+                p_split = torch.logit(new_opa).repeat(reps)
+            else:
+                p_split = p[sel].repeat(reps)
             p_new = torch.cat([p[rest], p_split], dim=0)
         return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
 
@@ -286,6 +319,7 @@ def split_approx_ab(
 
     _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
 
+    # Running state follows the usual split behavior (duplication of selected entries).
     for k, v in state.items():
         if isinstance(v, torch.Tensor):
             reps = [2] + [1] * (v.dim() - 1)
