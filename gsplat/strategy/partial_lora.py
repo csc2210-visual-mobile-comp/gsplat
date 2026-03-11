@@ -615,7 +615,14 @@ class LoRATargetStrategyAB(Strategy):
             if step < self.refine_scale2d_stop_iter:
                 is_too_big |= state["radii"] > self.prune_scale2d
             is_prune = is_prune | is_too_big
+        
+        num_params = len(params["means"])    
+        num_mask = len(is_prune)
+        if num_mask < num_params:
+            pad = torch.zeros(num_params - num_mask, dtype=torch.bool, device=is_prune.device)
+            is_prune = torch.cat([is_prune, pad])
 
+        
         n_prune = int(is_prune.sum().item())
         if n_prune > 0:
             remove(params=params, optimizers=optimizers, state=state, mask=is_prune)

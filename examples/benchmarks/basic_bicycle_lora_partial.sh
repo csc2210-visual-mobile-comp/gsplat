@@ -12,7 +12,7 @@ CONFIG_NAME="default"
 
 # LoRA options
 LORA_TARGETS=(colors scales quats)
-LORA_RANK=16
+LORA_RANK=64
 
 for SCENE in $SCENE_LIST; do
     if [ "$SCENE" = "bonsai" ] || [ "$SCENE" = "counter" ] || [ "$SCENE" = "kitchen" ] || [ "$SCENE" = "room" ]; then
