@@ -102,6 +102,13 @@ class Config:
     sh_degree: int = 3
     # Turn on another SH degree every this steps
     sh_degree_interval: int = 1000
+    # OUR CHANGE: LoRA rank for SH correction
+    disable_dynamic_rank: bool = False
+    lora_rank: int = 16
+    lora_max_rank: int = 32
+    lora_min_rank: int = 2
+    lora_rank_interval: int = 100
+    lora_quota: Tuple[float, float, float] = (0.2, 0.6, 0.2)
     # Initial opacity of GS
     init_opa: float = 0.1
     # Initial scale of GS
@@ -239,6 +246,7 @@ def create_splats_with_optimizers(
     shN_lr: float = 2.5e-3 / 20,
     scene_scale: float = 1.0,
     sh_degree: int = 3,
+    lora_rank: int = 16, # OUR CHANGE: Maximum LoRA rank for SH correction
     sparse_grad: bool = False,
     visible_adam: bool = False,
     batch_size: int = 1,
@@ -283,7 +291,14 @@ def create_splats_with_optimizers(
         colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
         colors[:, 0, :] = rgb_to_sh(rgbs)
         params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
-        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
+        # OUR CHANGE: LoRA Modifier 1
+        # params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
+        lora_A = torch.randn((N, lora_rank)) * 0.01
+        params.append(("lora_A", torch.nn.Parameter(lora_A), shN_lr))
+
+        # OUR CHANGE: Rank Tracker Mask
+        current_ranks = torch.full((N, 1), float(cfg.lora_min_rank))
+        params.append(("current_ranks", torch.nn.Parameter(current_ranks, requires_grad=False), 0.0))
     else:
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
@@ -312,7 +327,7 @@ def create_splats_with_optimizers(
             betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
             fused=True,
         )
-        for name, _, lr in params
+        for name, param, lr in params if param.requires_grad # OUR CHANGE: Check for gradients for ADAM
     }
     return splats, optimizers
 
@@ -401,6 +416,7 @@ class Runner:
             shN_lr=cfg.shN_lr,
             scene_scale=self.scene_scale,
             sh_degree=cfg.sh_degree,
+            lora_rank=cfg.lora_rank if cfg.disable_dynamic_rank else cfg.lora_max_rank, # OUR CHANGE: Maximum LoRA rank for SH correction
             sparse_grad=cfg.sparse_grad,
             visible_adam=cfg.visible_adam,
             batch_size=cfg.batch_size,
@@ -411,6 +427,19 @@ class Runner:
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
+        # OUR CHANGE: LoRA Modifier 2
+        shN_bands = (cfg.sh_degree + 1) ** 2 - 1
+        rank = cfg.lora_rank if cfg.disable_dynamic_rank else cfg.lora_max_rank
+        self.lora_B = torch.nn.Parameter(torch.randn(rank, 3 * shN_bands, device=self.device) * 0.01)
+        
+        # We must give Matrix B its own optimizer so Adam updates it!
+        self.lora_optimizers = [
+            torch.optim.Adam(
+                [self.lora_B], 
+                lr=cfg.shN_lr * math.sqrt(cfg.batch_size * world_size), 
+                eps=1e-15
+            )
+        ]
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
 
@@ -585,7 +614,38 @@ class Runner:
             colors = colors + self.splats["colors"]
             colors = torch.sigmoid(colors)
         else:
-            colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
+            # OUR CHANGE: Apply Dynamic Correction
+            # colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
+            shN_bands = (self.cfg.sh_degree + 1) ** 2 - 1
+
+            if self.cfg.disable_dynamic_rank:
+                lora_A = self.splats["lora_A"]
+                shN_computed = torch.matmul(lora_A, self.lora_B)
+            else:
+                # 1. Define the discrete capacity buckets
+                buckets = [2, 8, 32] 
+                
+                # 2. Pre-allocate the dense output tensor
+                shN_computed = torch.zeros(
+                    (self.splats["lora_A"].shape[0], self.lora_B.shape[1]), 
+                    device=self.device
+                )
+                
+                ranks_sq = self.splats["current_ranks"].squeeze()
+                
+                # 3. Iterate through buckets and perform dense GEMMs on slices
+                for r in buckets:
+                    mask_r = (ranks_sq == r)
+                    if not mask_r.any():
+                        continue
+                    
+                    A_slice = self.splats["lora_A"][mask_r, :r]
+                    B_slice = self.lora_B[:r, :]
+                    
+                    shN_computed[mask_r] = A_slice @ B_slice
+
+            shN_computed = shN_computed.view(-1, shN_bands, 3) 
+            colors = torch.cat([self.splats["sh0"], shN_computed], 1)  # [N, K, 3]
 
         if rasterize_mode is None:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
@@ -660,6 +720,58 @@ class Runner:
 
         return render_colors, render_alphas, info
 
+    # OUR CHANGE: Heatmap helper
+    @torch.no_grad()
+    def render_rank_heatmap(
+        self,
+        camtoworlds: Tensor,
+        Ks: Tensor,
+        width: int,
+        height: int,
+        min_rank: int,
+        max_rank: int,
+    ) -> Tensor:
+        """Renders a thermal heatmap of the current Gaussian LoRA ranks."""
+        # 1. Grab current geometry
+        means = self.splats["means"]
+        quats = self.splats["quats"]
+        scales = torch.exp(self.splats["scales"])
+        opacities = torch.sigmoid(self.splats["opacities"])
+
+        # 2. Normalize ranks (min_rank = 0.0, max_rank = 1.0)
+        ranks = self.splats["current_ranks"].float()
+        norm_ranks = (ranks - min_rank) / (max_rank - min_rank + 1e-8)
+        
+        # 3. Map to RGB (Blue = Low Rank, Red = High Rank)
+        heatmap_rgb = torch.zeros((ranks.shape[0], 3), device=self.device)
+        heatmap_rgb[:, 0] = norm_ranks.squeeze()        # Red channel
+        heatmap_rgb[:, 2] = 1.0 - norm_ranks.squeeze()  # Blue channel
+        
+        # 4. Convert RGB directly to base Spherical Harmonics (SH0)
+        SH_C0 = 0.28209479177387814
+        heatmap_sh0 = ((heatmap_rgb - 0.5) / SH_C0).unsqueeze(1) # [N, 1, 3]
+
+        # 5. Call the core rasterizer directly
+        rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
+        render_colors, _, _ = rasterization(
+            means=means,
+            quats=quats,
+            scales=scales,
+            opacities=opacities,
+            colors=heatmap_sh0,
+            viewmats=torch.linalg.inv(camtoworlds),
+            Ks=Ks,
+            width=width,
+            height=height,
+            sh_degree=0, # Force flat colors
+            packed=self.cfg.packed,
+            rasterize_mode=rasterize_mode,
+            distributed=self.world_size > 1,
+            camera_model=self.cfg.camera_model,
+        )
+        
+        return torch.clamp(render_colors, 0.0, 1.0)
+    
     def train(self):
         cfg = self.cfg
         device = self.device
@@ -850,6 +962,44 @@ class Runner:
 
             loss.backward()
 
+            # OUR CHANGE: Quantized Dynamic LoRA Rank Adjustment
+            if not cfg.disable_dynamic_rank and step > 0 and step % cfg.lora_rank_interval == 0:
+                if self.splats["lora_A"].grad is not None:
+                    grad_sum = self.splats["lora_A"].grad.abs().sum(dim=-1, keepdim=True)
+                    grad_frustration = grad_sum / (self.splats["current_ranks"].data + 1e-8)
+                    
+                    # 1. Find the exact gradient values at the top and bottom percentiles
+                    top_percentile = 1.0 - cfg.lora_quota[0]
+                    bottom_percentile = cfg.lora_quota[2]
+                    top_thresh = torch.quantile(grad_frustration, top_percentile)
+                    bottom_thresh = torch.quantile(grad_frustration, bottom_percentile)
+                    
+                    # 2. Create the strict assignment masks
+                    top_mask = grad_frustration >= top_thresh
+                    bottom_mask = grad_frustration <= bottom_thresh
+                    middle_mask = ~(top_mask | bottom_mask)
+                    
+                    # 3. Force the Gaussians into their assigned buckets
+                    r_data = self.splats["current_ranks"].data
+                    r_data[top_mask] = 32.0
+                    r_data[middle_mask] = 8.0
+                    r_data[bottom_mask] = 2.0
+
+                    rank_idx = torch.arange(cfg.lora_max_rank, device=self.device).unsqueeze(0) # [1, 32]
+                    active_mask = rank_idx < self.splats["current_ranks"] # [N, 32]
+                    dead_mask = ~active_mask
+
+                    fresh_noise = torch.randn_like(self.splats["lora_A"]) * 0.01
+                    self.splats["lora_A"].data[dead_mask] = fresh_noise[dead_mask]
+
+                    opt = self.optimizers["lora_A"]
+                    if self.splats["lora_A"] in opt.state:
+                        state = opt.state[self.splats["lora_A"]]
+                        if "exp_avg" in state:
+                            state["exp_avg"][dead_mask] = 0.0
+                        if "exp_avg_sq" in state:
+                            state["exp_avg_sq"][dead_mask] = 0.0
+
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
@@ -887,6 +1037,17 @@ class Runner:
                     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
                     self.writer.add_image("train/render", canvas, step)
+                # OUR CHANGE: Log LoRA-specific metrics to TensorBoard
+                if self.splats["lora_A"].grad is not None:
+                    grad_sum = self.splats["lora_A"].grad.abs().sum(dim=-1)
+                    grad_frustration = grad_sum / (self.splats["current_ranks"].data.squeeze() + 1e-8)
+                    
+                    avg_grad = grad_frustration.mean().item()
+                    avg_rank = self.splats["current_ranks"].float().mean().item()
+                    
+                    self.writer.add_scalar("lora/avg_grad_frustration", avg_grad, step)
+                    self.writer.add_scalar("lora/avg_rank", avg_rank, step)
+
                 self.writer.flush()
 
             # save checkpoint before updating the model
@@ -897,6 +1058,13 @@ class Runner:
                     "ellipse_time": time.time() - global_tic,
                     "num_GS": len(self.splats["means"]),
                 }
+
+                # OUR CHANGE: Include parameter count in stats for monitoring model
+                total_params = sum(p.numel() for p in self.splats.values())
+                if hasattr(self, "lora_B"):
+                    total_params += self.lora_B.numel()
+                stats["total_params"] = total_params
+
                 print("Step: ", step, stats)
                 with open(
                     f"{self.stats_dir}/train_step{step:04d}_rank{self.world_rank}.json",
@@ -937,7 +1105,18 @@ class Runner:
                     shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
                 else:
                     sh0 = self.splats["sh0"]
-                    shN = self.splats["shN"]
+                    # OUR CHANGE: Use the LoRA-corrected SH coefficients for export
+                    # shN = self.splats["shN"]
+                    shN_bands = (self.cfg.sh_degree + 1) ** 2 - 1
+                    if self.cfg.disable_dynamic_rank:
+                        lora_A = self.splats["lora_A"]
+                    else:
+                        rank_idx = torch.arange(self.cfg.lora_max_rank, device=self.device)
+                        rank_mask = (rank_idx < self.splats["current_ranks"]).float()
+                        lora_A = self.splats["lora_A"] * rank_mask
+
+                    shN_computed = torch.matmul(lora_A, self.lora_B)
+                    shN = shN_computed.view(-1, shN_bands, 3) 
 
                 means = self.splats["means"]
                 scales = self.splats["scales"]
@@ -979,6 +1158,10 @@ class Runner:
                 else:
                     visibility_mask = (info["radii"] > 0).all(-1).any(0)
 
+            # OUR CHANGE: GRADIENT CLIPPING
+            if self.splats["lora_A"].grad is not None and self.lora_B.grad is not None:
+                torch.nn.utils.clip_grad_norm_([self.splats["lora_A"], self.lora_B], max_norm=1.0)
+
             # optimize
             for optimizer in self.optimizers.values():
                 if cfg.visible_adam:
@@ -986,6 +1169,12 @@ class Runner:
                 else:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            
+            # OUR CHANGE: Step the LoRA optimizers
+            for optimizer in self.lora_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            
             for optimizer in self.pose_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -1085,7 +1274,18 @@ class Runner:
             ellipse_time += max(time.time() - tic, 1e-10)
 
             colors = torch.clamp(colors, 0.0, 1.0)
+
             canvas_list = [pixels, colors]
+
+            # OUR CHANGE: Generate the Heatmap
+            heatmap_colors = self.render_rank_heatmap(
+                camtoworlds=camtoworlds,
+                Ks=Ks,
+                width=width,
+                height=height,
+                min_rank=cfg.lora_min_rank,
+                max_rank=cfg.lora_max_rank,
+            )
 
             if world_rank == 0:
                 # write images
@@ -1094,6 +1294,14 @@ class Runner:
                 imageio.imwrite(
                     f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
                     canvas,
+                )
+
+                # OUR CHANGE: Save the LoRA rank heatmap for visualization
+                heatmap_canvas = heatmap_colors.squeeze(0).cpu().numpy()
+                heatmap_canvas = (heatmap_canvas * 255).astype(np.uint8)
+                imageio.imwrite(
+                    f"{self.render_dir}/{stage}_step{step}_{i:04d}_heatmap.png",
+                    heatmap_canvas,
                 )
 
                 pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
