@@ -105,11 +105,10 @@ class Config:
     # OUR CHANGE: LoRA rank for SH correction
     disable_dynamic_rank: bool = False
     lora_rank: int = 16
-    lora_max_rank: int = 64
+    lora_max_rank: int = 32
     lora_min_rank: int = 2
     lora_rank_interval: int = 100
-    lora_uprank_thresh: float = 8e-9
-    lora_downrank_thresh: float = 1e-9
+    lora_quota: Tuple[float, float, float] = (0.2, 0.6, 0.2)
     # Initial opacity of GS
     init_opa: float = 0.1
     # Initial scale of GS
@@ -621,12 +620,30 @@ class Runner:
 
             if self.cfg.disable_dynamic_rank:
                 lora_A = self.splats["lora_A"]
+                shN_computed = torch.matmul(lora_A, self.lora_B)
             else:
-                rank_idx = torch.arange(self.cfg.lora_max_rank, device=self.device)
-                rank_mask = (rank_idx < self.splats["current_ranks"]).float()
-                lora_A = self.splats["lora_A"] * rank_mask
+                # 1. Define the discrete capacity buckets
+                buckets = [2, 8, 32] 
+                
+                # 2. Pre-allocate the dense output tensor
+                shN_computed = torch.zeros(
+                    (self.splats["lora_A"].shape[0], self.lora_B.shape[1]), 
+                    device=self.device
+                )
+                
+                ranks_sq = self.splats["current_ranks"].squeeze()
+                
+                # 3. Iterate through buckets and perform dense GEMMs on slices
+                for r in buckets:
+                    mask_r = (ranks_sq == r)
+                    if not mask_r.any():
+                        continue
+                    
+                    A_slice = self.splats["lora_A"][mask_r, :r]
+                    B_slice = self.lora_B[:r, :]
+                    
+                    shN_computed[mask_r] = A_slice @ B_slice
 
-            shN_computed = torch.matmul(lora_A, self.lora_B)
             shN_computed = shN_computed.view(-1, shN_bands, 3) 
             colors = torch.cat([self.splats["sh0"], shN_computed], 1)  # [N, K, 3]
 
@@ -945,30 +962,43 @@ class Runner:
 
             loss.backward()
 
-            # OUR CHANGE: Dynamic LoRA Rank Adjustment
+            # OUR CHANGE: Quantized Dynamic LoRA Rank Adjustment
             if not cfg.disable_dynamic_rank and step > 0 and step % cfg.lora_rank_interval == 0:
                 if self.splats["lora_A"].grad is not None:
-                    # 1. Sum the absolute gradients (inactive columns are already 0)
                     grad_sum = self.splats["lora_A"].grad.abs().sum(dim=-1, keepdim=True)
-                    
-                    # 2. Divide by current active ranks to get "Per-Parameter Frustration"
-                    # Add a tiny epsilon to prevent division by zero, just in case
                     grad_frustration = grad_sum / (self.splats["current_ranks"].data + 1e-8)
                     
-                    # Up-rank struggling Gaussians
-                    promote_mask = grad_frustration > cfg.lora_uprank_thresh
-                    self.splats["current_ranks"].data[promote_mask] += 1
+                    # 1. Find the exact gradient values at the top and bottom percentiles
+                    top_percentile = 1.0 - cfg.lora_quota[0]
+                    bottom_percentile = cfg.lora_quota[2]
+                    top_thresh = torch.quantile(grad_frustration, top_percentile)
+                    bottom_thresh = torch.quantile(grad_frustration, bottom_percentile)
                     
-                    # Down-rank satisfied Gaussians
-                    demote_mask = grad_frustration < cfg.lora_downrank_thresh
-                    self.splats["current_ranks"].data[demote_mask] -= 1
+                    # 2. Create the strict assignment masks
+                    top_mask = grad_frustration >= top_thresh
+                    bottom_mask = grad_frustration <= bottom_thresh
+                    middle_mask = ~(top_mask | bottom_mask)
                     
-                    # Clamp to boundaries
-                    self.splats["current_ranks"].data = torch.clamp(
-                        self.splats["current_ranks"].data, 
-                        min=cfg.lora_min_rank, 
-                        max=cfg.lora_max_rank
-                    )
+                    # 3. Force the Gaussians into their assigned buckets
+                    r_data = self.splats["current_ranks"].data
+                    r_data[top_mask] = 32.0
+                    r_data[middle_mask] = 8.0
+                    r_data[bottom_mask] = 2.0
+
+                    rank_idx = torch.arange(cfg.lora_max_rank, device=self.device).unsqueeze(0) # [1, 32]
+                    active_mask = rank_idx < self.splats["current_ranks"] # [N, 32]
+                    dead_mask = ~active_mask
+
+                    fresh_noise = torch.randn_like(self.splats["lora_A"]) * 0.01
+                    self.splats["lora_A"].data[dead_mask] = fresh_noise[dead_mask]
+
+                    opt = self.optimizers["lora_A"]
+                    if self.splats["lora_A"] in opt.state:
+                        state = opt.state[self.splats["lora_A"]]
+                        if "exp_avg" in state:
+                            state["exp_avg"][dead_mask] = 0.0
+                        if "exp_avg_sq" in state:
+                            state["exp_avg_sq"][dead_mask] = 0.0
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
@@ -1127,6 +1157,10 @@ class Runner:
                     visibility_mask.scatter_(0, info["gaussian_ids"], 1)
                 else:
                     visibility_mask = (info["radii"] > 0).all(-1).any(0)
+
+            # OUR CHANGE: GRADIENT CLIPPING
+            if self.splats["lora_A"].grad is not None and self.lora_B.grad is not None:
+                torch.nn.utils.clip_grad_norm_([self.splats["lora_A"], self.lora_B], max_norm=1.0)
 
             # optimize
             for optimizer in self.optimizers.values():
