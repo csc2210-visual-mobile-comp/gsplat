@@ -109,6 +109,28 @@ class Config:
     lora_min_rank: int = 2
     lora_rank_interval: int = 100
     lora_quota: Tuple[float, float, float] = (0.2, 0.6, 0.2)
+    # The three discrete rank levels assigned to top/middle/bottom quota buckets.
+    # Must be ascending and lora_rank_buckets[2] must equal lora_max_rank.
+    lora_rank_buckets: Tuple[int, int, int] = (2, 8, 32)
+    # Dynamic rank scoring strategy:
+    #   "gradient"        — grad_sum / current_rank  (original)
+    #   "opacity_grad"    — grad_sum / (current_rank * opacity)
+    #   "sh_energy"       — L2 energy of the computed shN bands
+    lora_rank_strategy: str = "gradient"
+    # How bucket boundaries are computed from the score distribution:
+    #   "percentile" — fixed quota fractions (lora_quota), scene-agnostic
+    #   "stats"      — mean ± lora_stats_k * std, adapts to scene complexity
+    #   "kmeans"     — 1-D k-means (3 centroids); boundaries = midpoints between
+    #                  sorted centroids. Fully scene-adaptive, no quota needed.
+    lora_rank_threshold: str = "percentile"
+    lora_stats_k: float = 1.0
+    # Number of EM iterations for the "kmeans" threshold mode
+    lora_kmeans_iters: int = 10
+    # sh_energy warmup: for the first lora_warmup_cycles rank-adjustment
+    # intervals, use sh_energy scoring regardless of lora_rank_strategy.
+    # This avoids noisy gradient-based decisions before lora_A has learned
+    # anything meaningful. Set to 0 to disable.
+    lora_warmup_cycles: int = 5
     # Initial opacity of GS
     init_opa: float = 0.1
     # Initial scale of GS
@@ -566,6 +588,8 @@ class Runner:
 
         # Track if Gaussians are frozen (for controller distillation)
         self._gaussians_frozen = False
+        # Counts how many rank-adjustment cycles have completed (used for warmup)
+        self._rank_adjustment_cycles = 0
 
     def freeze_gaussians(self):
         """Freeze all Gaussian parameters for controller distillation.
@@ -623,8 +647,8 @@ class Runner:
                 shN_computed = torch.matmul(lora_A, self.lora_B)
             else:
                 # 1. Define the discrete capacity buckets
-                buckets = [2, 8, 32] 
-                
+                buckets = self.cfg.lora_rank_buckets
+
                 # 2. Pre-allocate the dense output tensor
                 shN_computed = torch.zeros(
                     (self.splats["lora_A"].shape[0], self.lora_B.shape[1]), 
@@ -964,41 +988,9 @@ class Runner:
 
             # OUR CHANGE: Quantized Dynamic LoRA Rank Adjustment
             if not cfg.disable_dynamic_rank and step > 0 and step % cfg.lora_rank_interval == 0:
-                if self.splats["lora_A"].grad is not None:
-                    grad_sum = self.splats["lora_A"].grad.abs().sum(dim=-1, keepdim=True)
-                    grad_frustration = grad_sum / (self.splats["current_ranks"].data + 1e-8)
-                    
-                    # 1. Find the exact gradient values at the top and bottom percentiles
-                    top_percentile = 1.0 - cfg.lora_quota[0]
-                    bottom_percentile = cfg.lora_quota[2]
-                    top_thresh = torch.quantile(grad_frustration, top_percentile)
-                    bottom_thresh = torch.quantile(grad_frustration, bottom_percentile)
-                    
-                    # 2. Create the strict assignment masks
-                    top_mask = grad_frustration >= top_thresh
-                    bottom_mask = grad_frustration <= bottom_thresh
-                    middle_mask = ~(top_mask | bottom_mask)
-                    
-                    # 3. Force the Gaussians into their assigned buckets
-                    r_data = self.splats["current_ranks"].data
-                    r_data[top_mask] = 32.0
-                    r_data[middle_mask] = 8.0
-                    r_data[bottom_mask] = 2.0
-
-                    rank_idx = torch.arange(cfg.lora_max_rank, device=self.device).unsqueeze(0) # [1, 32]
-                    active_mask = rank_idx < self.splats["current_ranks"] # [N, 32]
-                    dead_mask = ~active_mask
-
-                    fresh_noise = torch.randn_like(self.splats["lora_A"]) * 0.01
-                    self.splats["lora_A"].data[dead_mask] = fresh_noise[dead_mask]
-
-                    opt = self.optimizers["lora_A"]
-                    if self.splats["lora_A"] in opt.state:
-                        state = opt.state[self.splats["lora_A"]]
-                        if "exp_avg" in state:
-                            state["exp_avg"][dead_mask] = 0.0
-                        if "exp_avg_sq" in state:
-                            state["exp_avg_sq"][dead_mask] = 0.0
+                score = self._compute_lora_rank_score()
+                if score is not None:
+                    self._apply_lora_rank_buckets(score)
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
@@ -1472,6 +1464,180 @@ class Runner:
         for k in splats_c.keys():
             self.splats[k].data = splats_c[k].to(self.device)
         self.eval(step=step, stage="compress")
+
+    def _compute_lora_rank_score(self) -> Optional[Tensor]:
+        """Return a per-Gaussian score [N, 1] used to assign LoRA rank buckets.
+
+        Higher score → Gaussian needs more rank capacity.
+
+        Three strategies (set via cfg.lora_rank_strategy):
+
+        "gradient"  (current approach)
+            score = sum(|∇lora_A[i]|) / current_rank[i]
+            Measures optimization pressure per active LoRA parameter.
+            A Gaussian whose few active dimensions are being pushed hard
+            is "frustrated" and gets promoted.
+
+        "opacity_grad"
+            score = sum(|∇lora_A[i]|) / (current_rank[i] * opacity[i])
+            Same as "gradient" but divides by the Gaussian's opacity.
+            Nearly-transparent Gaussians contribute little to the rendered
+            image; their raw gradients can be large simply because they
+            barely participate. Dividing by opacity suppresses those
+            spurious signals so rank reflects view-dependent need, not
+            just visibility.
+
+        "sh_energy"
+            score = ||shN_computed[i]||^2  (summed over all SH bands and channels)
+            Measures how much view-dependent color variation each Gaussian
+            actually expresses through its current LoRA correction.
+            High energy → strong specularity / complex appearance → needs
+            more rank. Zero energy → flat appearance → can use low rank.
+            Evaluated without gradients on the current shN output.
+        """
+        cfg = self.cfg
+
+        # During the first lora_warmup_cycles rank-adjustment intervals, use
+        # sh_energy regardless of lora_rank_strategy. At this point lora_A is
+        # still near-random so gradient-based scores are mostly noise; the
+        # initial SH coefficients (fitted to point cloud colors) carry more
+        # signal about which Gaussians live in complex regions.
+        in_warmup = (
+            cfg.lora_warmup_cycles > 0
+            and self._rank_adjustment_cycles < cfg.lora_warmup_cycles
+        )
+        strategy = "sh_energy" if in_warmup else cfg.lora_rank_strategy
+
+        if strategy in ("gradient", "opacity_grad"):
+            if self.splats["lora_A"].grad is None:
+                return None
+            # sum of absolute gradients across all active LoRA dims  [N, 1]
+            grad_sum = self.splats["lora_A"].grad.abs().sum(dim=-1, keepdim=True)
+            # normalize by rank so a rank-32 Gaussian isn't unfairly promoted
+            # just because it has 32 numbers contributing to the sum
+            score = grad_sum / (self.splats["current_ranks"].data + 1e-8)
+
+            if strategy == "opacity_grad":
+                # further divide by opacity: a nearly-transparent Gaussian
+                # contributes little to the image, so its gradient pressure
+                # is less meaningful — don't promote it on that basis alone
+                opacity = torch.sigmoid(self.splats["opacities"]).unsqueeze(-1).detach()
+                score = score / (opacity + 1e-4)
+
+        elif strategy == "sh_energy":
+            # measure the L2 energy of the shN correction each Gaussian
+            # currently produces — high energy = complex view-dep color
+            with torch.no_grad():
+                buckets = cfg.lora_rank_buckets
+                shN = torch.zeros(
+                    (self.splats["lora_A"].shape[0], self.lora_B.shape[1]),
+                    device=self.device,
+                )
+                ranks_sq = self.splats["current_ranks"].squeeze()
+                for r in buckets:
+                    mask_r = ranks_sq == r
+                    if not mask_r.any():
+                        continue
+                    shN[mask_r] = self.splats["lora_A"][mask_r, :r] @ self.lora_B[:r, :]
+                # sum squared values over all SH bands × RGB channels  [N, 1]
+                score = (shN ** 2).sum(dim=-1, keepdim=True)
+        else:
+            raise ValueError(
+                f"Unknown lora_rank_strategy: {strategy!r}. "
+                "Choose 'gradient', 'opacity_grad', or 'sh_energy'."
+            )
+
+        return score
+
+    @torch.no_grad()
+    def _kmeans_thresholds(self, score: Tensor, n_iter: int = 10) -> Tuple[Tensor, Tensor]:
+        """1-D k-means with 3 centroids.
+
+        Returns (top_thresh, bottom_thresh) — the midpoints between sorted
+        centroids.  These are scene-adaptive: a mostly-diffuse scene will
+        naturally push two centroids close together at the low end, leaving
+        a wide high bucket only for the genuinely complex Gaussians.
+
+        Initialization: centroids at the 25th / 50th / 75th percentiles so
+        that early iterations already reflect the real distribution.
+        """
+        s = score.float().squeeze()
+        centroids = torch.quantile(s, torch.tensor([0.25, 0.5, 0.75], device=s.device))
+
+        for _ in range(n_iter):
+            # [N, 3] distance to each centroid
+            dists = (s.unsqueeze(1) - centroids.unsqueeze(0)).abs()
+            assignments = dists.argmin(dim=1)  # [N]
+            for i in range(3):
+                mask = assignments == i
+                if mask.any():
+                    centroids[i] = s[mask].mean()
+
+        sorted_c, _ = centroids.sort()
+        bottom_thresh = (sorted_c[0] + sorted_c[1]) / 2.0
+        top_thresh    = (sorted_c[1] + sorted_c[2]) / 2.0
+        return top_thresh, bottom_thresh
+
+    def _apply_lora_rank_buckets(self, score: Tensor) -> None:
+        """Assign each Gaussian to a rank bucket based on its score,
+        then re-initialize demoted lora_A columns and zero their momentum.
+
+        Two threshold modes (cfg.lora_rank_threshold):
+          "percentile": fixed quota fractions from cfg.lora_quota
+              top    lora_quota[0] fraction  → highest bucket
+              middle lora_quota[1] fraction  → middle bucket
+              bottom lora_quota[2] fraction  → lowest bucket
+          "stats": scene-adaptive mean ± lora_stats_k * std
+              score > mean + k*std  → highest bucket
+              score < mean - k*std  → lowest bucket
+              everything else       → middle bucket
+        """
+        cfg = self.cfg
+
+        if cfg.lora_rank_threshold == "percentile":
+            top_thresh    = torch.quantile(score, 1.0 - cfg.lora_quota[0])
+            bottom_thresh = torch.quantile(score, cfg.lora_quota[2])
+        elif cfg.lora_rank_threshold == "stats":
+            mean = score.mean()
+            std  = score.std()
+            top_thresh    = mean + cfg.lora_stats_k * std
+            bottom_thresh = mean - cfg.lora_stats_k * std
+        elif cfg.lora_rank_threshold == "kmeans":
+            top_thresh, bottom_thresh = self._kmeans_thresholds(
+                score, n_iter=cfg.lora_kmeans_iters
+            )
+        else:
+            raise ValueError(
+                f"Unknown lora_rank_threshold: {cfg.lora_rank_threshold!r}. "
+                "Choose 'percentile', 'stats', or 'kmeans'."
+            )
+
+        top_mask    = score >= top_thresh
+        bottom_mask = score <= bottom_thresh
+        middle_mask = ~(top_mask | bottom_mask)
+
+        r_data = self.splats["current_ranks"].data
+        r_data[top_mask]    = float(cfg.lora_rank_buckets[2])
+        r_data[middle_mask] = float(cfg.lora_rank_buckets[1])
+        r_data[bottom_mask] = float(cfg.lora_rank_buckets[0])
+
+        # columns beyond current_rank are "dead" — re-init so they can be
+        # promoted cleanly later without stale values biasing the output
+        rank_idx  = torch.arange(cfg.lora_max_rank, device=self.device).unsqueeze(0)  # [1, max]
+        dead_mask = rank_idx >= self.splats["current_ranks"]  # [N, max]
+
+        fresh_noise = torch.randn_like(self.splats["lora_A"]) * 0.01
+        self.splats["lora_A"].data[dead_mask] = fresh_noise[dead_mask]
+
+        opt = self.optimizers["lora_A"]
+        if self.splats["lora_A"] in opt.state:
+            state = opt.state[self.splats["lora_A"]]
+            if "exp_avg" in state:
+                state["exp_avg"][dead_mask] = 0.0
+            if "exp_avg_sq" in state:
+                state["exp_avg_sq"][dead_mask] = 0.0
+
+        self._rank_adjustment_cycles += 1
 
     @torch.no_grad()
     def _viewer_render_fn(

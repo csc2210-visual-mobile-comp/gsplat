@@ -1,0 +1,126 @@
+"""
+Summarize experiment results into per-scene CSV tables.
+
+Reads val_step*.json files from each result directory defined in
+run_experiments.py and outputs one CSV per result_base (scene+resolution),
+comparing PSNR / SSIM / LPIPS across all experiment variants.
+
+Usage:
+    python summarize_results.py                    # prints tables + writes CSVs
+    python summarize_results.py --results-root .   # custom root (default: current dir)
+"""
+
+import csv
+import json
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+
+# ── mirror the scene list from run_experiments.py ────────────────────────────
+# Each entry: (data_dir, result_base_dir, data_factor)
+SCENES: List[Tuple[str, str, int]] = [
+    ("data/pitcher_scene007", "results/pitcher_scene007", 1),
+    # ("data/360_v2/counter", "results/counter_f1", 1),
+]
+# ─────────────────────────────────────────────────────────────────────────────
+
+METRICS = ["psnr", "ssim", "lpips"]
+OPTIONAL_METRICS = ["cc_psnr", "cc_ssim", "cc_lpips", "avg_rank", "num_GS"]
+
+
+def load_val_stats(result_dir: Path) -> Optional[Dict]:
+    """Return the last val_step*.json found in result_dir/stats/, or None."""
+    stats_dir = result_dir / "stats"
+    if not stats_dir.exists():
+        return None
+    files = sorted(stats_dir.glob("val_step*.json"))
+    if not files:
+        return None
+    return json.loads(files[-1].read_text())
+
+
+def collect_rows(result_base: Path) -> List[Dict]:
+    """Walk all subdirectories of result_base and collect one row per experiment."""
+    rows = []
+    if not result_base.exists():
+        return rows
+
+    for exp_dir in sorted(result_base.iterdir()):
+        if not exp_dir.is_dir():
+            continue
+        stats = load_val_stats(exp_dir)
+        row = {"experiment": exp_dir.name}
+        if stats is None:
+            row["status"] = "missing"
+            for m in METRICS + OPTIONAL_METRICS:
+                row[m] = ""
+        else:
+            row["status"] = "ok"
+            for m in METRICS:
+                row[m] = f"{stats[m]:.4f}" if m in stats else ""
+            for m in OPTIONAL_METRICS:
+                val = stats.get(m)
+                if val is None:
+                    row[m] = ""
+                elif m == "num_GS":
+                    row[m] = str(int(val))
+                else:
+                    row[m] = f"{val:.4f}"
+        rows.append(row)
+    return rows
+
+
+def print_table(result_base: str, rows: List[Dict]) -> None:
+    if not rows:
+        print(f"\n[{result_base}] — no results found")
+        return
+
+    cols = ["experiment", "status"] + METRICS + OPTIONAL_METRICS
+    # compute column widths
+    widths = {c: len(c) for c in cols}
+    for row in rows:
+        for c in cols:
+            widths[c] = max(widths[c], len(str(row.get(c, ""))))
+
+    header = "  ".join(c.ljust(widths[c]) for c in cols)
+    sep = "  ".join("-" * widths[c] for c in cols)
+
+    print(f"\n{'='*len(header)}")
+    print(f"Scene: {result_base}")
+    print(f"{'='*len(header)}")
+    print(header)
+    print(sep)
+    for row in rows:
+        print("  ".join(str(row.get(c, "")).ljust(widths[c]) for c in cols))
+
+
+def write_csv(csv_path: Path, rows: List[Dict]) -> None:
+    cols = ["experiment", "status"] + METRICS + OPTIONAL_METRICS
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"  → saved {csv_path}")
+
+
+def main() -> None:
+    # default root = same directory as this script so it works from any cwd
+    results_root = Path(__file__).parent
+    if "--results-root" in sys.argv:
+        idx = sys.argv.index("--results-root")
+        results_root = Path(sys.argv[idx + 1]).resolve()
+
+    for (_data_dir, result_base_str, _factor) in SCENES:
+        result_base = results_root / result_base_str
+        rows = collect_rows(result_base)
+        print_table(result_base_str, rows)
+
+        if rows:
+            csv_path = result_base / "summary.csv"
+            result_base.mkdir(parents=True, exist_ok=True)
+            write_csv(csv_path, rows)
+
+
+if __name__ == "__main__":
+    main()
