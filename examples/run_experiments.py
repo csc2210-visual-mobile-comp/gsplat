@@ -149,12 +149,12 @@ def run_training(run: Run, dry_run: bool = False) -> bool:
 
     if run.lora_mode == "static":
         cmd += [
-            "--disable_dynamic_rank",
+            "--lora_mode", "static",
             "--lora_rank", str(run.lora_rank),
         ]
     elif run.lora_mode == "dynamic":
         cmd += [
-            "--no-disable_dynamic_rank",
+            "--lora_mode", "dynamic",
             "--lora_max_rank",       str(run.lora_max_rank),
             "--lora_min_rank",       str(run.lora_min_rank),
             "--lora_rank_interval",  str(run.lora_rank_interval),
@@ -167,7 +167,8 @@ def run_training(run: Run, dry_run: bool = False) -> bool:
             "--lora_warmup_cycles",  str(run.lora_warmup_cycles),
             "--lora_kmeans_iters",   str(run.lora_kmeans_iters),
         ]
-    # "none": no extra lora flags — trainer defaults apply
+    else:  # "none"
+        cmd += ["--lora_mode", "none"]  # explicit; trainer default is also "none"
 
     print("\n" + "=" * 60)
     print(f"  {run.label}")
