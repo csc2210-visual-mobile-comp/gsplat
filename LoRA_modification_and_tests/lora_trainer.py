@@ -107,7 +107,6 @@ class Config:
     lora_rank: int = 16
     lora_max_rank: int = 32
     lora_min_rank: int = 2
-    lora_rank_interval: int = 100
     lora_quota: Tuple[float, float, float] = (0.2, 0.6, 0.2)
     # Initial opacity of GS
     init_opa: float = 0.1
@@ -299,6 +298,8 @@ def create_splats_with_optimizers(
         # OUR CHANGE: Rank Tracker Mask
         current_ranks = torch.full((N, 1), float(cfg.lora_min_rank))
         params.append(("current_ranks", torch.nn.Parameter(current_ranks, requires_grad=False), 0.0))
+        lora_grad_accum = torch.zeros((N, 1))
+        params.append(("lora_grad_accum", torch.nn.Parameter(lora_grad_accum, requires_grad=False), 0.0))
     else:
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
@@ -963,42 +964,53 @@ class Runner:
             loss.backward()
 
             # OUR CHANGE: Quantized Dynamic LoRA Rank Adjustment
-            if not cfg.disable_dynamic_rank and step > 0 and step % cfg.lora_rank_interval == 0:
-                if self.splats["lora_A"].grad is not None:
-                    grad_sum = self.splats["lora_A"].grad.abs().sum(dim=-1, keepdim=True)
-                    grad_frustration = grad_sum / (self.splats["current_ranks"].data + 1e-8)
-                    
-                    # 1. Find the exact gradient values at the top and bottom percentiles
-                    top_percentile = 1.0 - cfg.lora_quota[0]
-                    bottom_percentile = cfg.lora_quota[2]
-                    top_thresh = torch.quantile(grad_frustration, top_percentile)
-                    bottom_thresh = torch.quantile(grad_frustration, bottom_percentile)
-                    
-                    # 2. Create the strict assignment masks
-                    top_mask = grad_frustration >= top_thresh
-                    bottom_mask = grad_frustration <= bottom_thresh
-                    middle_mask = ~(top_mask | bottom_mask)
-                    
-                    # 3. Force the Gaussians into their assigned buckets
-                    r_data = self.splats["current_ranks"].data
-                    r_data[top_mask] = 32.0
-                    r_data[middle_mask] = 8.0
-                    r_data[bottom_mask] = 2.0
+            if not cfg.disable_dynamic_rank:
+                with torch.no_grad():
+                    if self.splats["lora_A"].grad is not None:
+                        current_step_frustration = self.splats["lora_A"].grad.abs().sum(dim=-1, keepdim=True)
+                        self.splats["lora_grad_accum"].add_(current_step_frustration)
 
-                    rank_idx = torch.arange(cfg.lora_max_rank, device=self.device).unsqueeze(0) # [1, 32]
-                    active_mask = rank_idx < self.splats["current_ranks"] # [N, 32]
-                    dead_mask = ~active_mask
+            if not cfg.disable_dynamic_rank:
+                allocation_interval = len(self.trainset)
+                if hasattr(self.cfg.strategy, "refine_stop_iter"):
+                    freeze_step = self.cfg.strategy.refine_stop_iter
+                else:
+                    freeze_step = 15000
+                
+                if step > 0 and step % allocation_interval == 0 and step <= freeze_step:
+                    with torch.no_grad():
+                        grad_frustration = self.splats["lora_grad_accum"] / (self.splats["current_ranks"].data + 1e-8)
+                        
+                        top_percentile = 1.0 - cfg.lora_quota[0]
+                        bottom_percentile = cfg.lora_quota[2]
+                        top_thresh = torch.quantile(grad_frustration, top_percentile)
+                        bottom_thresh = torch.quantile(grad_frustration, bottom_percentile)
+                        
+                        top_mask = grad_frustration >= top_thresh
+                        bottom_mask = grad_frustration <= bottom_thresh
+                        middle_mask = ~(top_mask | bottom_mask)
 
-                    fresh_noise = torch.randn_like(self.splats["lora_A"]) * 0.01
-                    self.splats["lora_A"].data[dead_mask] = fresh_noise[dead_mask]
+                        r_data = self.splats["current_ranks"].data
+                        r_data[top_mask] = float(cfg.lora_max_rank)
+                        r_data[middle_mask] = 8.0
+                        r_data[bottom_mask] = float(cfg.lora_min_rank)
 
-                    opt = self.optimizers["lora_A"]
-                    if self.splats["lora_A"] in opt.state:
-                        state = opt.state[self.splats["lora_A"]]
-                        if "exp_avg" in state:
-                            state["exp_avg"][dead_mask] = 0.0
-                        if "exp_avg_sq" in state:
-                            state["exp_avg_sq"][dead_mask] = 0.0
+                        rank_idx = torch.arange(cfg.lora_max_rank, device=self.device).unsqueeze(0)
+                        active_mask = rank_idx < self.splats["current_ranks"]
+                        dead_mask = ~active_mask
+
+                        fresh_noise = torch.randn_like(self.splats["lora_A"]) * 0.01
+                        self.splats["lora_A"].data[dead_mask] = fresh_noise[dead_mask]
+
+                        opt = self.optimizers["lora_A"]
+                        if self.splats["lora_A"] in opt.state:
+                            state = opt.state[self.splats["lora_A"]]
+                            if "exp_avg" in state:
+                                state["exp_avg"][dead_mask] = 0.0
+                            if "exp_avg_sq" in state:
+                                state["exp_avg_sq"][dead_mask] = 0.0
+                        
+                        self.splats["lora_grad_accum"].zero_()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
@@ -1072,6 +1084,8 @@ class Runner:
                 ) as f:
                     json.dump(stats, f)
                 data = {"step": step, "splats": self.splats.state_dict()}
+                if hasattr(self, "lora_B"):
+                    data["lora_B"] = self.lora_B.data
                 if cfg.pose_opt:
                     if world_size > 1:
                         data["pose_adjust"] = self.pose_adjust.module.state_dict()
