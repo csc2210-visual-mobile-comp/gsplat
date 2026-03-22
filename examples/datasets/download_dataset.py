@@ -15,12 +15,14 @@ dataset_names = Literal[
     "bilarf_data",
     "zipnerf",
     "zipnerf_undistorted",
+    "refnerf",
 ]
 
 # dataset urls
 urls = {
     "mipnerf360": "http://storage.googleapis.com/gresearch/refraw360/360_v2.zip",
     "mipnerf360_extra": "https://storage.googleapis.com/gresearch/refraw360/360_extra_scenes.zip",
+    "refnerf": "https://storage.googleapis.com/gresearch/refraw360/ref_real.zip",
     "bilarf_data": "https://huggingface.co/datasets/Yuehao/bilarf_data/resolve/main/bilarf_data.zip",
     "zipnerf": [
         "https://storage.googleapis.com/gresearch/refraw360/zipnerf/berlin.zip",
@@ -43,6 +45,7 @@ dataset_rename_map = {
     "bilarf_data": "bilarf",
     "zipnerf": "zipnerf",
     "zipnerf_undistorted": "zipnerf_undistorted",
+    "refnerf": "refnerf"
 }
 
 
