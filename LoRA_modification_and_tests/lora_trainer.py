@@ -247,6 +247,7 @@ def create_splats_with_optimizers(
     sh_degree: int = 3,
     lora_rank: int = 16, # OUR CHANGE: Maximum LoRA rank for SH correction
     disable_dynamic_rank: bool = False,  # OUR CHANGE: Whether to use static rank (affects optimizer choice for lora_A)
+    lora_min_rank: int = 2,  # OUR CHANGE: Minimum LoRA rank for bucket initialization
     sparse_grad: bool = False,
     visible_adam: bool = False,
     batch_size: int = 1,
@@ -293,11 +294,15 @@ def create_splats_with_optimizers(
         params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
         # OUR CHANGE: LoRA Modifier 1
         # params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
-        lora_A = torch.randn((N, lora_rank)) * 0.01
-        params.append(("lora_A", torch.nn.Parameter(lora_A), shN_lr))
+        if disable_dynamic_rank:
+            # Static rank mode: lora_A lives in splats with Adam optimizer
+            lora_A = torch.randn((N, lora_rank)) * 0.01
+            params.append(("lora_A", torch.nn.Parameter(lora_A), shN_lr))
 
         # OUR CHANGE: Rank Tracker Mask
-        current_ranks = torch.full((N, 1), float(cfg.lora_min_rank))
+        # In dynamic mode, current_ranks and lora_grad_accum are always present.
+        # In static mode, current_ranks is still useful for heatmap rendering.
+        current_ranks = torch.full((N, 1), float(lora_min_rank))
         params.append(("current_ranks", torch.nn.Parameter(current_ranks, requires_grad=False), 0.0))
         lora_grad_accum = torch.zeros((N, 1))
         params.append(("lora_grad_accum", torch.nn.Parameter(lora_grad_accum, requires_grad=False), 0.0))
@@ -321,9 +326,9 @@ def create_splats_with_optimizers(
         optimizer_class = SelectiveAdam
     else:
         optimizer_class = torch.optim.Adam
-    # OUR CHANGE: In dynamic rank mode, lora_A uses a no-op SGD(lr=0) so the densification
-    # strategy can still resize it, while actual gradient updates are handled manually
-    # via compact per-bucket Adam states (saves memory vs full [N, max_rank] Adam state).
+    # OUR CHANGE: In dynamic rank mode, lora_A is NOT in splats at all — per-bucket
+    # nn.Parameter tensors (self.lora_A_buckets) handle it instead.
+    # In static rank mode, lora_A is in splats and gets a normal Adam optimizer.
     optimizers = {
         name: optimizer_class(
             [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
@@ -333,15 +338,8 @@ def create_splats_with_optimizers(
             fused=True,
         )
         for name, param, lr in params
-        if param.requires_grad and not (name == "lora_A" and not disable_dynamic_rank)
+        if param.requires_grad
     }
-    # For dynamic rank: SGD(lr=0) has no optimizer state, so it's memory-free and
-    # just satisfies the densification strategy's requirement that trainable params
-    # have a corresponding optimizer entry.
-    if not disable_dynamic_rank and "lora_A" in splats:
-        optimizers["lora_A"] = torch.optim.SGD(
-            [{"params": splats["lora_A"], "lr": 0.0, "name": "lora_A"}]
-        )
     return splats, optimizers
 
 
@@ -431,6 +429,7 @@ class Runner:
             sh_degree=cfg.sh_degree,
             lora_rank=cfg.lora_rank if cfg.disable_dynamic_rank else cfg.lora_max_rank, # OUR CHANGE: Maximum LoRA rank for SH correction
             disable_dynamic_rank=cfg.disable_dynamic_rank,  # OUR CHANGE: Pass through for optimizer selection
+            lora_min_rank=cfg.lora_min_rank,  # OUR CHANGE: Pass min rank for bucket initialization
             sparse_grad=cfg.sparse_grad,
             visible_adam=cfg.visible_adam,
             batch_size=cfg.batch_size,
@@ -455,14 +454,11 @@ class Runner:
             )
         ]
 
-        # OUR CHANGE: Compact per-bucket Adam states for lora_A (dynamic rank only).
-        # Store Adam hyperparams matching the original lora_A optimizer config.
+        # OUR CHANGE: Per-bucket nn.Parameter tensors + Adam optimizers for lora_A (dynamic rank only).
+        # Each bucket has its own compact [N_r, r] parameter and optimizer, so memory
+        # scales with actual rank usage rather than a full [N, max_rank] tensor.
         if not cfg.disable_dynamic_rank:
-            BS = cfg.batch_size * world_size
-            self.lora_A_adam_lr = cfg.shN_lr * math.sqrt(BS)
-            self.lora_A_adam_betas = (1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999))
-            self.lora_A_adam_eps = 1e-15 / math.sqrt(BS)
-            self._init_compact_lora_states()
+            self._init_bucket_tensors()
 
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
@@ -646,27 +642,15 @@ class Runner:
                 lora_A = self.splats["lora_A"]
                 shN_computed = torch.matmul(lora_A, self.lora_B)
             else:
-                # 1. Define the discrete capacity buckets
-                buckets = [2, 8, 32] 
-                
-                # 2. Pre-allocate the dense output tensor
-                shN_computed = torch.zeros(
-                    (self.splats["lora_A"].shape[0], self.lora_B.shape[1]), 
-                    device=self.device
-                )
-                
-                ranks_sq = self.splats["current_ranks"].squeeze()
-                
-                # 3. Iterate through buckets and perform dense GEMMs on slices
+                # OUR CHANGE: Use per-bucket nn.Parameter tensors for lora_A
+                buckets = [self.cfg.lora_min_rank, 8, self.cfg.lora_max_rank]
+                N = self.splats["current_ranks"].shape[0]
+                shN_computed = torch.zeros(N, self.lora_B.shape[1], device=self.device)
                 for r in buckets:
-                    mask_r = (ranks_sq == r)
-                    if not mask_r.any():
+                    idxs = self.lora_A_bucket_indices[r]
+                    if len(idxs) == 0:
                         continue
-                    
-                    A_slice = self.splats["lora_A"][mask_r, :r]
-                    B_slice = self.lora_B[:r, :]
-                    
-                    shN_computed[mask_r] = A_slice @ B_slice
+                    shN_computed[idxs] = self.lora_A_buckets[r] @ self.lora_B[:r, :]
 
             shN_computed = shN_computed.view(-1, shN_bands, 3) 
             colors = torch.cat([self.splats["sh0"], shN_computed], 1)  # [N, K, 3]
@@ -796,19 +780,23 @@ class Runner:
         
         return torch.clamp(render_colors, 0.0, 1.0)
 
-    # OUR CHANGE: Compact per-bucket Adam state helpers for memory-efficient dynamic LoRA rank
+    # OUR CHANGE: Per-bucket nn.Parameter + Adam optimizer helpers for memory-efficient dynamic LoRA rank
 
-    def _init_compact_lora_states(self):
-        """Initialize compact per-bucket Adam states for lora_A.
+    def _init_bucket_tensors(self):
+        """Initialize per-bucket lora_A nn.Parameters and Adam optimizers.
 
-        Maintains separate [N_r, r] exp_avg/exp_avg_sq tensors for each rank
-        bucket instead of a single [N, max_rank] tensor, saving significant
-        GPU memory when most Gaussians are at low rank.
+        Creates compact [N_r, r] parameter tensors (initially all N at min_rank)
+        with matching per-bucket Adam optimizers, so parameter + gradient +
+        optimizer state all scale with actual rank usage.
         """
         cfg = self.cfg
         buckets = [cfg.lora_min_rank, 8, cfg.lora_max_rank]
         N = len(self.splats["means"])
         device = self.device
+        BS = cfg.batch_size * self.world_size
+        lr = cfg.shN_lr * math.sqrt(BS)
+        betas = (1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999))
+        eps = 1e-15 / math.sqrt(BS)
 
         # Initially all Gaussians are at min_rank
         self.lora_A_bucket_indices = {
@@ -816,60 +804,82 @@ class Runner:
             8: torch.empty(0, dtype=torch.long, device=device),
             cfg.lora_max_rank: torch.empty(0, dtype=torch.long, device=device),
         }
-        self.lora_A_exp_avg = {
-            r: torch.zeros(len(self.lora_A_bucket_indices[r]), r, device=device)
-            for r in buckets
-        }
-        self.lora_A_exp_avg_sq = {
-            r: torch.zeros(len(self.lora_A_bucket_indices[r]), r, device=device)
-            for r in buckets
-        }
-        self.lora_A_step_count = {r: 0 for r in buckets}
+        self.lora_A_buckets = {}
+        self.lora_A_bucket_optims = {}
+        for r in buckets:
+            n_r = len(self.lora_A_bucket_indices[r])
+            param = torch.nn.Parameter(torch.randn(n_r, r, device=device) * 0.01)
+            self.lora_A_buckets[r] = param
+            self.lora_A_bucket_optims[r] = torch.optim.Adam(
+                [param], lr=lr, betas=betas, eps=eps
+            )
         self.N_prev_for_densification = N
 
     @torch.no_grad()
-    def _apply_lora_A_adam_step(self):
-        """Apply manual per-bucket Adam update to splats['lora_A'].
+    def _scatter_buckets_to_dense(self) -> torch.Tensor:
+        """Scatter per-bucket lora_A data into a dense [N, max_rank] tensor.
 
-        Uses compact [N_r, r] states so only active rank columns carry
-        optimizer state, saving memory compared to full [N, max_rank] Adam.
+        Returns a detached float32 zeros tensor with each bucket's .data
+        placed in the correct rows and columns.
         """
-        if self.splats["lora_A"].grad is None:
-            return
-
         cfg = self.cfg
+        N = self.splats["current_ranks"].shape[0]
         buckets = [cfg.lora_min_rank, 8, cfg.lora_max_rank]
-        beta1, beta2 = self.lora_A_adam_betas
-        grad = self.splats["lora_A"].grad  # [N, max_rank]
-
+        dense = torch.zeros(N, cfg.lora_max_rank, device=self.device)
         for r in buckets:
-            indices = self.lora_A_bucket_indices[r]
-            if len(indices) == 0:
+            idxs = self.lora_A_bucket_indices[r]
+            if len(idxs) == 0:
                 continue
-
-            self.lora_A_step_count[r] += 1
-            t = self.lora_A_step_count[r]
-
-            g = grad[indices, :r]  # [N_r, r] — only active columns
-
-            # Update first and second moment estimates
-            self.lora_A_exp_avg[r].mul_(beta1).add_(g, alpha=1 - beta1)
-            self.lora_A_exp_avg_sq[r].mul_(beta2).addcmul_(g, g, value=1 - beta2)
-
-            # Bias-corrected step size
-            step_size = self.lora_A_adam_lr * math.sqrt(1 - beta2 ** t) / (1 - beta1 ** t)
-
-            denom = self.lora_A_exp_avg_sq[r].sqrt().add_(self.lora_A_adam_eps)
-            self.splats["lora_A"].data[indices, :r] -= step_size * self.lora_A_exp_avg[r] / denom
+            dense[idxs, :r] = self.lora_A_buckets[r].data
+        return dense
 
     @torch.no_grad()
-    def _update_compact_states_for_rank_change(self, new_r_per_gaussian: torch.Tensor):
-        """Rebuild compact Adam states after a rank-adjustment step.
+    def _rebuild_buckets_from_dense(self, dense: torch.Tensor):
+        """Rebuild bucket tensors and fresh Adam optimizers from a dense [N_new, max_rank] tensor.
 
-        For each Gaussian, carries over optimizer state for columns that remain
-        active (min(old_rank, new_rank)) and zero-initializes any new columns,
-        effectively shrinking state for downranked Gaussians and expanding it
-        (with zeros) for upranked ones.
+        Called after densification when N changes. Uses current_ranks to determine
+        bucket membership. Optimizer state is reset to zero (acceptable — densification
+        already resets optimizer state for other params).
+
+        Args:
+            dense: [N_new, max_rank] tensor from splats["lora_A_dense"].data after densification.
+        """
+        cfg = self.cfg
+        buckets = [cfg.lora_min_rank, 8, cfg.lora_max_rank]
+        N = dense.shape[0]
+        device = self.device
+        BS = cfg.batch_size * self.world_size
+        lr = cfg.shN_lr * math.sqrt(BS)
+        betas = (1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999))
+        eps = 1e-15 / math.sqrt(BS)
+
+        ranks = self.splats["current_ranks"].data.squeeze().long()  # [N_new]
+
+        new_bucket_indices = {}
+        new_buckets = {}
+        new_optims = {}
+        for r in buckets:
+            idxs = (ranks == r).nonzero(as_tuple=True)[0]
+            new_bucket_indices[r] = idxs
+            data = dense[idxs, :r].clone() if len(idxs) > 0 else torch.zeros(0, r, device=device)
+            param = torch.nn.Parameter(data)
+            new_buckets[r] = param
+            new_optims[r] = torch.optim.Adam([param], lr=lr, betas=betas, eps=eps)
+
+        self.lora_A_bucket_indices = new_bucket_indices
+        self.lora_A_buckets = new_buckets
+        self.lora_A_bucket_optims = new_optims
+        self.N_prev_for_densification = N
+
+    @torch.no_grad()
+    def _update_buckets_for_rank_change(self, new_r_per_gaussian: torch.Tensor):
+        """Rebuild bucket tensors and Adam optimizers after a rank-adjustment step.
+
+        For each Gaussian, carries over param data and Adam exp_avg/exp_avg_sq for
+        columns that remain active (min(old_r, new_r)). For upranked Gaussians,
+        new columns are initialized with fresh noise. Builds new nn.Parameters and
+        Adam optimizers with manually set state so carried momentum is preserved
+        while bias correction restarts cleanly.
 
         Args:
             new_r_per_gaussian: [N] int tensor of new rank values per Gaussian.
@@ -878,8 +888,12 @@ class Runner:
         buckets = [cfg.lora_min_rank, 8, cfg.lora_max_rank]
         device = self.device
         N = len(self.splats["means"])
+        BS = cfg.batch_size * self.world_size
+        lr = cfg.shN_lr * math.sqrt(BS)
+        betas = (1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999))
+        eps = 1e-15 / math.sqrt(BS)
 
-        # Build reverse lookup: gaussian index -> (old rank, row in old bucket tensor)
+        # Build reverse lookup: gaussian index -> row in old bucket tensor
         gauss_to_old_row = torch.empty(N, dtype=torch.long, device=device)
         old_r_per_gauss = torch.zeros(N, dtype=torch.long, device=device)
         for r in buckets:
@@ -890,68 +904,61 @@ class Runner:
             old_r_per_gauss[old_idxs] = r
 
         new_bucket_indices = {}
-        new_exp_avg = {}
-        new_exp_avg_sq = {}
+        new_buckets = {}
+        new_optims = {}
 
         for new_r in buckets:
             new_idxs = (new_r_per_gaussian == new_r).nonzero(as_tuple=True)[0]
             new_bucket_indices[new_r] = new_idxs
             n = len(new_idxs)
 
-            new_ea = torch.zeros(n, new_r, device=device)
-            new_ea_sq = torch.zeros(n, new_r, device=device)
+            new_data = torch.zeros(n, new_r, device=device)
+            new_exp_avg = torch.zeros(n, new_r, device=device)
+            new_exp_avg_sq = torch.zeros(n, new_r, device=device)
 
             if n > 0:
-                gauss_old_rs = old_r_per_gauss[new_idxs]    # old rank per gaussian
-                gauss_old_rows = gauss_to_old_row[new_idxs]  # row in old bucket tensor
+                gauss_old_rs = old_r_per_gauss[new_idxs]
+                gauss_old_rows = gauss_to_old_row[new_idxs]
 
                 for old_r in buckets:
                     from_old_r = (gauss_old_rs == old_r)
                     if not from_old_r.any():
                         continue
 
-                    new_pos = from_old_r.nonzero(as_tuple=True)[0]
-                    old_rows = gauss_old_rows[new_pos]
-                    keep = min(old_r, new_r)  # columns to carry over
+                    pos = from_old_r.nonzero(as_tuple=True)[0]  # positions in new bucket
+                    rows = gauss_old_rows[pos]                   # rows in old bucket tensor
+                    keep = min(old_r, new_r)
 
-                    # Carry over optimizer state for retained columns
-                    new_ea[new_pos, :keep] = self.lora_A_exp_avg[old_r][old_rows, :keep]
-                    new_ea_sq[new_pos, :keep] = self.lora_A_exp_avg_sq[old_r][old_rows, :keep]
+                    # Carry over parameter data for retained columns
+                    new_data[pos, :keep] = self.lora_A_buckets[old_r].data[rows, :keep]
 
-            new_exp_avg[new_r] = new_ea
-            new_exp_avg_sq[new_r] = new_ea_sq
+                    # For newly added columns (uprank), init with fresh noise
+                    if new_r > old_r:
+                        new_data[pos, old_r:new_r] = torch.randn(len(pos), new_r - old_r, device=device) * 0.01
+
+                    # Carry over Adam state for retained columns
+                    old_optim = self.lora_A_bucket_optims[old_r]
+                    old_param = self.lora_A_buckets[old_r]
+                    if old_param in old_optim.state and "exp_avg" in old_optim.state[old_param]:
+                        state = old_optim.state[old_param]
+                        new_exp_avg[pos, :keep] = state["exp_avg"][rows, :keep]
+                        new_exp_avg_sq[pos, :keep] = state["exp_avg_sq"][rows, :keep]
+
+            param = torch.nn.Parameter(new_data)
+            optim = torch.optim.Adam([param], lr=lr, betas=betas, eps=eps)
+            # Manually set optimizer state so carried-over momentum is preserved
+            # while bias correction restarts (step=0)
+            optim.state[param] = {
+                "step": torch.tensor(0.0),
+                "exp_avg": new_exp_avg,
+                "exp_avg_sq": new_exp_avg_sq,
+            }
+            new_buckets[new_r] = param
+            new_optims[new_r] = optim
 
         self.lora_A_bucket_indices = new_bucket_indices
-        self.lora_A_exp_avg = new_exp_avg
-        self.lora_A_exp_avg_sq = new_exp_avg_sq
-        # Reset step count so bias correction restarts cleanly after rank changes
-        self.lora_A_step_count = {r: 0 for r in buckets}
-
-    @torch.no_grad()
-    def _rebuild_compact_lora_states(self):
-        """Rebuild compact Adam states from scratch after densification.
-
-        Called whenever N changes (Gaussians added/pruned). Old optimizer state
-        cannot be reliably mapped to new Gaussian indices after pruning+compaction,
-        so we reset to zeros (consistent with standard 3DGS densification behavior).
-        """
-        cfg = self.cfg
-        buckets = [cfg.lora_min_rank, 8, cfg.lora_max_rank]
-        N = len(self.splats["means"])
-        ranks = self.splats["current_ranks"].data.squeeze().long()  # [N]
-
-        self.lora_A_bucket_indices = {}
-        self.lora_A_exp_avg = {}
-        self.lora_A_exp_avg_sq = {}
-
-        for r in buckets:
-            idxs = (ranks == r).nonzero(as_tuple=True)[0]
-            self.lora_A_bucket_indices[r] = idxs
-            self.lora_A_exp_avg[r] = torch.zeros(len(idxs), r, device=self.device)
-            self.lora_A_exp_avg_sq[r] = torch.zeros(len(idxs), r, device=self.device)
-
-        self.lora_A_step_count = {r: 0 for r in buckets}
-        self.N_prev_for_densification = N
+        self.lora_A_buckets = new_buckets
+        self.lora_A_bucket_optims = new_optims
 
     def train(self):
         cfg = self.cfg
@@ -1143,12 +1150,14 @@ class Runner:
 
             loss.backward()
 
-            # OUR CHANGE: Quantized Dynamic LoRA Rank Adjustment
+            # OUR CHANGE: Quantized Dynamic LoRA Rank Adjustment — accumulate per-bucket gradients
             if not cfg.disable_dynamic_rank:
                 with torch.no_grad():
-                    if self.splats["lora_A"].grad is not None:
-                        current_step_frustration = self.splats["lora_A"].grad.abs().sum(dim=-1, keepdim=True)
-                        self.splats["lora_grad_accum"].add_(current_step_frustration)
+                    for r in [cfg.lora_min_rank, 8, cfg.lora_max_rank]:
+                        bucket_param = self.lora_A_buckets[r]
+                        if bucket_param.grad is not None:
+                            frustration = bucket_param.grad.abs().sum(dim=-1, keepdim=True)
+                            self.splats["lora_grad_accum"][self.lora_A_bucket_indices[r]] += frustration
 
             if not cfg.disable_dynamic_rank:
                 allocation_interval = len(self.trainset)
@@ -1171,7 +1180,7 @@ class Runner:
                         middle_mask = ~(top_mask | bottom_mask)
 
                         # Compute new rank per Gaussian BEFORE updating current_ranks,
-                        # so _update_compact_states_for_rank_change can compare old vs new.
+                        # so _update_buckets_for_rank_change can compare old vs new.
                         new_r_per_gaussian = self.splats["current_ranks"].data.squeeze().long().clone()
                         new_r_per_gaussian[top_mask.squeeze()] = cfg.lora_max_rank
                         new_r_per_gaussian[middle_mask.squeeze()] = 8
@@ -1182,18 +1191,10 @@ class Runner:
                         r_data[middle_mask] = 8.0
                         r_data[bottom_mask] = float(cfg.lora_min_rank)
 
-                        # Reinitialize dead columns in lora_A with fresh noise
-                        rank_idx = torch.arange(cfg.lora_max_rank, device=self.device).unsqueeze(0)
-                        active_mask = rank_idx < self.splats["current_ranks"]
-                        dead_mask = ~active_mask
-                        fresh_noise = torch.randn_like(self.splats["lora_A"]) * 0.01
-                        self.splats["lora_A"].data[dead_mask] = fresh_noise[dead_mask]
-
-                        # OUR CHANGE: Shrink/expand compact optimizer states to match new
-                        # rank assignments instead of zeroing a full [N, max_rank] buffer.
-                        # This is the key memory saving: downranked Gaussians lose their
-                        # extra columns from exp_avg/exp_avg_sq; upranked ones gain zeros.
-                        self._update_compact_states_for_rank_change(new_r_per_gaussian)
+                        # OUR CHANGE: Rebuild per-bucket nn.Parameters with carried-over param
+                        # data and Adam state. Dead columns (rank shrunk) are discarded;
+                        # new columns (upranked) get fresh noise — all handled in the method.
+                        self._update_buckets_for_rank_change(new_r_per_gaussian)
 
                         self.splats["lora_grad_accum"].zero_()
 
@@ -1235,15 +1236,72 @@ class Runner:
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
                     self.writer.add_image("train/render", canvas, step)
                 # OUR CHANGE: Log LoRA-specific metrics to TensorBoard
-                if self.splats["lora_A"].grad is not None:
-                    grad_sum = self.splats["lora_A"].grad.abs().sum(dim=-1)
-                    grad_frustration = grad_sum / (self.splats["current_ranks"].data.squeeze() + 1e-8)
-                    
+                # Check if any bucket has a gradient (use min_rank bucket as proxy)
+                _any_lora_grad = any(
+                    self.lora_A_buckets[r].grad is not None
+                    for r in [cfg.lora_min_rank, 8, cfg.lora_max_rank]
+                ) if not cfg.disable_dynamic_rank else self.splats["lora_A"].grad is not None
+                if _any_lora_grad:
+                    # compute grad_frustration using lora_grad_accum (already accumulated above)
+                    grad_frustration = self.splats["lora_grad_accum"].squeeze() / (self.splats["current_ranks"].data.squeeze() + 1e-8)
                     avg_grad = grad_frustration.mean().item()
                     avg_rank = self.splats["current_ranks"].float().mean().item()
-                    
                     self.writer.add_scalar("lora/avg_grad_frustration", avg_grad, step)
                     self.writer.add_scalar("lora/avg_rank", avg_rank, step)
+
+                # OUR CHANGE: Detailed LoRA memory breakdown logging for debugging.
+                #
+                # Why this matters: max_memory_allocated() reports the historical PEAK
+                # (inflated by densification temporaries), masking the steady-state
+                # savings. These scalars show CURRENT allocation and break down exactly
+                # where lora_A memory goes.
+                if not cfg.disable_dynamic_rank:
+                    N_gs = len(self.splats["means"])
+                    # Current (not peak) GPU allocation
+                    mem_current_gb = torch.cuda.memory_allocated() / 1024**3
+                    self.writer.add_scalar("mem/current_gb", mem_current_gb, step)
+                    self.writer.add_scalar("mem/peak_gb", mem, step)
+
+                    # Per-bucket parameter memory (compact [N_r, r] tensors)
+                    bucket_param_mb = sum(
+                        self.lora_A_buckets[r].numel() * 4 / 1024**2
+                        for r in [cfg.lora_min_rank, 8, cfg.lora_max_rank]
+                    )
+                    self.writer.add_scalar("lora_mem/bucket_param_mb", bucket_param_mb, step)
+
+                    # Hypothetical full param memory if we used [N, max_rank]
+                    hypothetical_full_param_mb = N_gs * cfg.lora_max_rank * 4 / 1024**2
+                    self.writer.add_scalar("lora_mem/hypothetical_full_param_mb", hypothetical_full_param_mb, step)
+                    self.writer.add_scalar("lora_mem/param_saved_mb", hypothetical_full_param_mb - bucket_param_mb, step)
+
+                    # Compact optimizer state from actual bucket Adam states
+                    compact_state_mb = 0.0
+                    for r in [cfg.lora_min_rank, 8, cfg.lora_max_rank]:
+                        param = self.lora_A_buckets[r]
+                        if param in self.lora_A_bucket_optims[r].state:
+                            s = self.lora_A_bucket_optims[r].state[param]
+                            for key in ["exp_avg", "exp_avg_sq"]:
+                                if key in s:
+                                    compact_state_mb += s[key].numel() * 4 / 1024**2
+                    self.writer.add_scalar("lora_mem/compact_optimizer_state_mb", compact_state_mb, step)
+
+                    # Hypothetical Adam state if we used full [N, max_rank] tensors
+                    hypothetical_adam_mb = 2 * N_gs * cfg.lora_max_rank * 4 / 1024**2
+                    self.writer.add_scalar("lora_mem/hypothetical_adam_mb", hypothetical_adam_mb, step)
+                    self.writer.add_scalar(
+                        "lora_mem/optimizer_state_saved_mb",
+                        hypothetical_adam_mb - compact_state_mb,
+                        step,
+                    )
+
+                    # Per-bucket Gaussian counts — tells you the rank distribution
+                    buckets = [cfg.lora_min_rank, 8, cfg.lora_max_rank]
+                    for r in buckets:
+                        n_r = len(self.lora_A_bucket_indices[r])
+                        self.writer.add_scalar(f"lora_rank/n_at_rank_{r}", n_r, step)
+                        self.writer.add_scalar(
+                            f"lora_rank/frac_at_rank_{r}", n_r / max(N_gs, 1), step
+                        )
 
                 self.writer.flush()
 
@@ -1271,6 +1329,9 @@ class Runner:
                 data = {"step": step, "splats": self.splats.state_dict()}
                 if hasattr(self, "lora_B"):
                     data["lora_B"] = self.lora_B.data
+                if not self.cfg.disable_dynamic_rank and hasattr(self, "lora_A_buckets"):
+                    data["lora_A_buckets"] = {r: self.lora_A_buckets[r].data for r in [self.cfg.lora_min_rank, 8, self.cfg.lora_max_rank]}
+                    data["lora_A_bucket_indices"] = {r: self.lora_A_bucket_indices[r] for r in [self.cfg.lora_min_rank, 8, self.cfg.lora_max_rank]}
                 if cfg.pose_opt:
                     if world_size > 1:
                         data["pose_adjust"] = self.pose_adjust.module.state_dict()
@@ -1309,13 +1370,16 @@ class Runner:
                     shN_bands = (self.cfg.sh_degree + 1) ** 2 - 1
                     if self.cfg.disable_dynamic_rank:
                         lora_A = self.splats["lora_A"]
+                        shN_computed = torch.matmul(lora_A, self.lora_B)
                     else:
-                        rank_idx = torch.arange(self.cfg.lora_max_rank, device=self.device)
-                        rank_mask = (rank_idx < self.splats["current_ranks"]).float()
-                        lora_A = self.splats["lora_A"] * rank_mask
+                        N_ply = len(self.splats["means"])
+                        shN_computed = torch.zeros(N_ply, self.lora_B.shape[1], device=self.device)
+                        for r in [self.cfg.lora_min_rank, 8, self.cfg.lora_max_rank]:
+                            idxs = self.lora_A_bucket_indices[r]
+                            if len(idxs) > 0:
+                                shN_computed[idxs] = self.lora_A_buckets[r].data @ self.lora_B.data[:r, :]
 
-                    shN_computed = torch.matmul(lora_A, self.lora_B)
-                    shN = shN_computed.view(-1, shN_bands, 3) 
+                    shN = shN_computed.view(-1, shN_bands, 3)
 
                 means = self.splats["means"]
                 scales = self.splats["scales"]
@@ -1358,29 +1422,33 @@ class Runner:
                     visibility_mask = (info["radii"] > 0).all(-1).any(0)
 
             # OUR CHANGE: GRADIENT CLIPPING
-            if self.splats["lora_A"].grad is not None and self.lora_B.grad is not None:
-                torch.nn.utils.clip_grad_norm_([self.splats["lora_A"], self.lora_B], max_norm=1.0)
-
-            # OUR CHANGE: Apply compact per-bucket Adam update for lora_A.
-            # Must be called after gradient clipping and before zero_grad().
-            # In static rank mode, lora_A is updated normally via self.optimizers["lora_A"].
             if not cfg.disable_dynamic_rank:
-                self._apply_lora_A_adam_step()
+                lora_params = [self.lora_A_buckets[r] for r in [cfg.lora_min_rank, 8, cfg.lora_max_rank]
+                               if self.lora_A_buckets[r].grad is not None]
+                if lora_params and self.lora_B.grad is not None:
+                    torch.nn.utils.clip_grad_norm_(lora_params + [self.lora_B], max_norm=1.0)
+            else:
+                if self.splats["lora_A"].grad is not None and self.lora_B.grad is not None:
+                    torch.nn.utils.clip_grad_norm_([self.splats["lora_A"], self.lora_B], max_norm=1.0)
 
             # optimize
             for name, optimizer in self.optimizers.items():
-                # OUR CHANGE: SGD(lr=0) used for lora_A in dynamic rank mode does not
-                # support the visibility_mask argument that SelectiveAdam takes.
-                if cfg.visible_adam and name != "lora_A":
+                if cfg.visible_adam:
                     optimizer.step(visibility_mask)
                 else:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-            
-            # OUR CHANGE: Step the LoRA optimizers
+
+            # OUR CHANGE: Step the LoRA optimizers (lora_B)
             for optimizer in self.lora_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+
+            # OUR CHANGE: Step per-bucket lora_A optimizers
+            if not cfg.disable_dynamic_rank:
+                for r in [cfg.lora_min_rank, 8, cfg.lora_max_rank]:
+                    self.lora_A_bucket_optims[r].step()
+                    self.lora_A_bucket_optims[r].zero_grad(set_to_none=True)
             
             for optimizer in self.pose_optimizers:
                 optimizer.step()
@@ -1393,6 +1461,14 @@ class Runner:
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
                 scheduler.step()
+
+            # OUR CHANGE: Scatter bucket tensors into a temporary dense splat so the
+            # densification strategy can resize lora_A values along with other params.
+            if not cfg.disable_dynamic_rank:
+                _lora_A_dense_for_densification = self._scatter_buckets_to_dense()
+                self.splats["lora_A_dense"] = torch.nn.Parameter(
+                    _lora_A_dense_for_densification, requires_grad=False
+                )
 
             # Run post-backward steps after backward and optimizer
             if isinstance(self.cfg.strategy, DefaultStrategy):
@@ -1416,12 +1492,14 @@ class Runner:
             else:
                 assert_never(self.cfg.strategy)
 
-            # OUR CHANGE: After densification, N may have changed. Rebuild compact lora_A
-            # Adam states from scratch since pruning+compaction invalidates old index mappings.
+            # OUR CHANGE: After densification, N may have changed. Rebuild bucket tensors
+            # from the dense splat that was sized alongside other params by the strategy.
             if not cfg.disable_dynamic_rank:
                 N_current = len(self.splats["means"])
                 if N_current != self.N_prev_for_densification:
-                    self._rebuild_compact_lora_states()
+                    self._rebuild_buckets_from_dense(self.splats["lora_A_dense"].data)
+                del self.splats["lora_A_dense"]
+                self.N_prev_for_densification = N_current
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
