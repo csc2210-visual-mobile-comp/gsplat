@@ -199,6 +199,8 @@ class Parser:
                 colmap_image_dir, image_dir + "_png", factor=factor
             )
             image_files = sorted(_get_rel_paths(image_dir))
+        colmap_name_map = {f.lower(): f for f in colmap_files}
+        image_names = [colmap_name_map.get(f.lower(), f) for f in image_names]
         colmap_to_image = dict(zip(colmap_files, image_files))
         image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
 
