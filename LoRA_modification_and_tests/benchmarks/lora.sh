@@ -15,11 +15,9 @@ SAVE_STEPS="2000 7000"
 # ---------------------------------------------------------------------------
 # Fix image extensions once per scene (JPG → needed by the loader)
 # ---------------------------------------------------------------------------
-for SCENE in $SCENE_LIST; do
-    for f in "$SCENE_DIR/$SCENE/images/"*.jpg; do
-        [ -e "$f" ] || continue
-        mv "$f" "${f%.jpg}.JPG" || true
-    done
+for f in "$SCENE_DIR/sedan/images/"*.jpg; do
+    [ -e "$f" ] || continue
+    mv "$f" "${f%.jpg}.JPG" || true
 done
 
 # ---------------------------------------------------------------------------
