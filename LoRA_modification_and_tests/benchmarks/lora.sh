@@ -1,16 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # LoRA dynamic-rank benchmark — refnerf dataset
-#
-# Variants
-# --------
-#  lora_d_high    — Percentile mode; 40 % high / 40 % mid / 20 % low.
-#  lora_d_mid     — Percentile mode; 20 % high / 60 % mid / 20 % low (default quota).
-#  lora_d_low     — Percentile mode; 10 % high / 20 % mid / 70 % low.
 
 SCENE_DIR="data/refnerf"
 RESULT_DIR="results/benchmark/lora"
-SCENE_LIST="sedan"
+SCENE_LIST="gardenspheres sedan toycar"
 RENDER_TRAJ_PATH="ellipse"
 GPU=0
 
@@ -30,7 +24,6 @@ done
 
 # ---------------------------------------------------------------------------
 # Helper: train one variant, then evaluate every saved checkpoint
-# Usage: run_variant <scene> <data_factor> <variant_name> [extra lora_trainer args…]
 # ---------------------------------------------------------------------------
 run_variant() {
     local SCENE=$1
@@ -67,6 +60,12 @@ run_variant() {
             --ckpt "$CKPT" \
             "${EXTRA_ARGS[@]}"
     done
+
+    # -----------------------------------------------------------------------
+    # Cleanup to save disk
+    # -----------------------------------------------------------------------
+    echo "=== Cleaning up ckpts/ and renders/ for $OUT ==="
+    rm -rf "$OUT/ckpts/" "$OUT/renders/"
 }
 
 # ---------------------------------------------------------------------------
@@ -81,15 +80,15 @@ for SCENE in $SCENE_LIST; do
         DATA_FACTOR=4
     fi
 
-    # lora_d_high — 40 % high / 40 % mid / 20 % low
+    # lora_d_high
     run_variant "$SCENE" "$DATA_FACTOR" lora_d_high \
         --lora-quota 0.40 0.40 0.20
 
-    # lora_d_mid — 20 % high / 60 % mid / 20 % low
+    # lora_d_mid
     run_variant "$SCENE" "$DATA_FACTOR" lora_d_mid \
         --lora-quota 0.20 0.60 0.20
 
-    # lora_d_low — 10 % high / 20 % mid / 70 % low
+    # lora_d_low
     run_variant "$SCENE" "$DATA_FACTOR" lora_d_low \
         --lora-quota 0.10 0.20 0.70
 done
