@@ -39,7 +39,6 @@ run_variant() {
     CUDA_VISIBLE_DEVICES=$GPU python lora_trainer.py default \
         --disable-viewer \
         --data-factor "$DATA_FACTOR" \
-        --render-traj-path "$RENDER_TRAJ_PATH" \
         --data-dir "$SCENE_DIR/$SCENE/" \
         --result-dir "$OUT" \
         --max-steps "$MAX_STEPS" \
@@ -54,7 +53,6 @@ run_variant() {
         CUDA_VISIBLE_DEVICES=$GPU python lora_trainer.py default \
             --disable-viewer \
             --data-factor "$DATA_FACTOR" \
-            --render-traj-path "$RENDER_TRAJ_PATH" \
             --data-dir "$SCENE_DIR/$SCENE/" \
             --result-dir "$OUT" \
             --ckpt "$CKPT" \
