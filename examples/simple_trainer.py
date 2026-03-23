@@ -202,12 +202,11 @@ class Config:
     # OUR CHANGE: LoRA SH correction — lora_mode controls whether/how LoRA is used:
     #   "none"    — no LoRA, original shN coefficients (default)
     #   "static"  — fixed rank LoRA (lora_rank for all Gaussians)
-    #   "dynamic" — per-Gaussian rank from [lora_rank_buckets], adjusted every lora_rank_interval steps
+    #   "dynamic" — per-Gaussian rank from [lora_rank_buckets], adjusted once per epoch
     lora_mode: str = "none"
     lora_rank: int = 16
     lora_max_rank: int = 32
     lora_min_rank: int = 2
-    lora_rank_interval: int = 100
     lora_quota: Tuple[float, float, float] = (0.2, 0.6, 0.2)
     # The three discrete rank levels assigned to top/middle/bottom quota buckets.
     # Must be ascending and lora_rank_buckets[2] must equal lora_max_rank.
@@ -330,6 +329,8 @@ def create_splats_with_optimizers(
             # OUR CHANGE: Rank Tracker — stores per-Gaussian active rank (not gradient-optimized)
             current_ranks = torch.full((N, 1), float(lora_rank))
             params.append(("current_ranks", torch.nn.Parameter(current_ranks, requires_grad=False), 0.0))
+            lora_grad_accum = torch.zeros((N, 1))
+            params.append(("lora_grad_accum", torch.nn.Parameter(lora_grad_accum, requires_grad=False), 0.0))
     else:
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
@@ -985,10 +986,24 @@ class Runner:
             loss.backward()
 
             # OUR CHANGE: Quantized Dynamic LoRA Rank Adjustment
-            if cfg.lora_mode == "dynamic" and step > 0 and step % cfg.lora_rank_interval == 0:
-                score = self._compute_lora_rank_score()
-                if score is not None:
-                    self._apply_lora_rank_buckets(score)
+            if cfg.lora_mode == "dynamic":
+                with torch.no_grad():
+                    if self.splats["lora_A"].grad is not None:
+                        self.splats["lora_grad_accum"].add_(
+                            self.splats["lora_A"].grad.abs().sum(dim=-1, keepdim=True)
+                        )
+
+                allocation_interval = len(self.trainset)
+                if hasattr(self.cfg.strategy, "refine_stop_iter"):
+                    freeze_step = self.cfg.strategy.refine_stop_iter
+                else:
+                    freeze_step = 15000
+
+                if step > 0 and step % allocation_interval == 0 and step <= freeze_step:
+                    score = self._compute_lora_rank_score()
+                    if score is not None:
+                        self._apply_lora_rank_buckets(score)
+                        self.splats["lora_grad_accum"].zero_()
 
             # OUR CHANGE: Periodic rank heatmap during training (only for LoRA modes)
             if (world_rank == 0 and cfg.lora_mode != "none" and cfg.lora_heatmap_interval > 0
@@ -1067,6 +1082,8 @@ class Runner:
                 ) as f:
                     json.dump(stats, f)
                 data = {"step": step, "splats": self.splats.state_dict()}
+                if hasattr(self, "lora_B"):
+                    data["lora_B"] = self.lora_B.data
                 if cfg.pose_opt:
                     if world_size > 1:
                         data["pose_adjust"] = self.pose_adjust.module.state_dict()
@@ -1510,10 +1527,9 @@ class Runner:
         strategy = "sh_energy" if in_warmup else cfg.lora_rank_strategy
 
         if strategy in ("gradient", "opacity_grad"):
-            if self.splats["lora_A"].grad is None:
+            grad_sum = self.splats["lora_grad_accum"]
+            if grad_sum.sum() == 0:
                 return None
-            # sum of absolute gradients across all active LoRA dims  [N, 1]
-            grad_sum = self.splats["lora_A"].grad.abs().sum(dim=-1, keepdim=True)
             # normalize by rank so a rank-32 Gaussian isn't unfairly promoted
             # just because it has 32 numbers contributing to the sum
             score = grad_sum / (self.splats["current_ranks"].data + 1e-8)
@@ -1751,6 +1767,8 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         ]
         for k in runner.splats.keys():
             runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
+        if hasattr(runner, "lora_B") and "lora_B" in ckpts[0]:
+            runner.lora_B.data = ckpts[0]["lora_B"]
         if runner.post_processing_module is not None:
             pp_state = ckpts[0].get("post_processing")
             if pp_state is not None:
