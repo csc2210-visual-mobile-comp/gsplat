@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCENE_DIR="data/refnerf"
 RESULT_DIR="results/benchmark/lora"
-SCENE_LIST="sedan"
+SCENE_LIST="gardenspheres sedan toycar"
 RENDER_TRAJ_PATH="ellipse"
 
 CONFIG_NAME="default"
@@ -11,6 +11,10 @@ LORA_RANK=32
 
 # Define LoRA target combinations
 LORA_TARGET_SETS=(
+    "colors quats"
+    "colors scales"
+    "colors opacities"
+    "colors quats scales"
     "quats scales"
     "quats scales opacities"
 )
@@ -21,7 +25,7 @@ for f in data/refnerf/sedan/images/*.jpg; do
 done
 
 for SCENE in $SCENE_LIST; do
-    if [ "$SCENE" = "bonsai" ] || [ "$SCENE" = "counter" ] || [ "$SCENE" = "kitchen" ] || [ "$SCENE" = "room" ] || [ "$SCENE" = "sedan" ]; then
+    if [ "$SCENE" = "bonsai" ] || [ "$SCENE" = "counter" ] || [ "$SCENE" = "kitchen" ] || [ "$SCENE" = "room" ]; then
         DATA_FACTOR=2
     else
         DATA_FACTOR=4
@@ -39,8 +43,8 @@ for SCENE in $SCENE_LIST; do
         read -a TARGET_ARRAY <<< "$TARGETS"
 
         CUDA_VISIBLE_DEVICES=0 python partial_lora_trainer.py "$CONFIG_NAME" \
-            --max-steps 8000 \
-            --eval-steps 2000 4000 8000 \
+            --max-steps 7000 \
+            --eval-steps 2000 7000 \
             --save-steps 2000 \
             --disable-viewer \
             --data-factor "$DATA_FACTOR" \
