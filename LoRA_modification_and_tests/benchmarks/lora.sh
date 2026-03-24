@@ -44,19 +44,6 @@ run_variant() {
         --save-steps $SAVE_STEPS \
         "${EXTRA_ARGS[@]}"
 
-    echo "=== Evaluating  scene=$SCENE  variant=$VARIANT ==="
-
-    for CKPT in "$OUT/ckpts/"*.pt; do
-        [ -e "$CKPT" ] || continue
-        CUDA_VISIBLE_DEVICES=$GPU python lora_trainer.py default \
-            --disable-viewer \
-            --data-factor "$DATA_FACTOR" \
-            --data-dir "$SCENE_DIR/$SCENE/" \
-            --result-dir "$OUT" \
-            --ckpt "$CKPT" \
-            "${EXTRA_ARGS[@]}"
-    done
-
     # -----------------------------------------------------------------------
     # Cleanup to save disk
     # -----------------------------------------------------------------------
