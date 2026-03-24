@@ -11,7 +11,7 @@ Runs the following suite per (scene, resolution):
 
 To run:
     python run_experiments.py           # full suite
-    python run_experiments.py --dry-run # print commands without executing
+    python run_experiments.py --dry-run # print  commands without executing
 
 After training, summarize results with:
     python summarize_results.py
@@ -30,8 +30,9 @@ from typing import List, Optional, Tuple
 # Each entry: (data_dir, result_base_dir, data_factor)
 #   data_factor 1 = original resolution, 4 = images_4 downsampled
 SCENES: List[Tuple[str, str, int]] = [
-    ("data/pitcher_scene007", "results/pitcher_scene007", 1),  # downsampled
-    # ("data/360_v2/counter", "results/counter_f1", 1),  # original resolution
+    ("data/sedan", "results/sedan_f4", 4),
+    ("data/sedan", "results/sedan_f2", 2),
+    ("data/pitcher_scene001", "results/pitcher_scene001", 1),
 ]
 
 # Training duration
@@ -40,28 +41,42 @@ MAX_STEPS: int = 7_000
 # SH degree used for all LoRA experiments
 LORA_SH_DEGREE: int = 3
 
+# Static LoRA ranks to sweep
+LORA_STATIC_RANKS: List[int] = [2, 8, 16]
+
 # --- Which experiment groups to run ---
-RUN_NO_LORA:      bool = False   # 2.1-2.3: baselines at SH=1, 2, 3
-RUN_LORA_STATIC:  bool = False   # 2.4-2.5: static LoRA rank=2 and rank=16
-RUN_LORA_DYNAMIC: bool = True   # 2.6:     dynamic LoRA
+RUN_NO_LORA:      bool = False    # baselines at SH=1, 2, 3
+RUN_LORA_STATIC:  bool = False    # static LoRA at each rank in LORA_STATIC_RANKS
+RUN_LORA_DYNAMIC: bool = True     # dynamic LoRA
+
+# Set True to skip training and only re-run eval on existing checkpoints
+EVAL_ONLY: bool = False
 
 # Dynamic LoRA shared parameters
 LORA_MAX_RANK:      int   = 32
 LORA_MIN_RANK:      int   = 2
-LORA_RANK_INTERVAL: int   = 100
 LORA_QUOTA: Tuple[float, float, float] = (0.4, 0.4, 0.2)
 LORA_STATS_K:       float = 1.0
 LORA_WARMUP_CYCLES: int   = 5
 LORA_KMEANS_ITERS:  int   = 10
+# Rank regularization weight for "learned" threshold mode (λ in MSE + λ·rank_penalty).
+# Higher → stronger pressure toward lower rank; lower → prioritize quality.
+LORA_RANK_LAMBDA:   float = 0.01
 
 # Each entry: (strategy, threshold)
-#   strategy  : "gradient" | "opacity_grad" | "sh_energy"
-#   threshold : "percentile" | "stats" | "kmeans"
+#   strategy  : "gradient" | "opacity_grad" | "sh_energy" | "none" (for "learned")
+#   threshold : "percentile" | "stats" | "kmeans" | "gmm" | "learned"
 LORA_DYNAMIC_CONFIGS: List[Tuple[str, str]] = [
-    ("gradient",  "percentile"),
-    # ("gradient",  "kmeans"),
-    ("sh_energy", "percentile"),
-    # ("sh_energy", "kmeans"),
+    # ("gradient",     "percentile"),
+    # ("gradient",     "kmeans"),
+    # ("gradient",     "gmm"),
+    # ("opacity_grad", "percentile"),
+    # ("opacity_grad", "kmeans"),
+    # ("opacity_grad", "gmm"),
+    # ("sh_energy",    "percentile"),
+    # ("sh_energy",    "kmeans"),
+    # ("sh_energy",    "gmm"),
+    ("none",         "learned"),   # end-to-end learned gates; strategy is unused
 ]
 
 # =============================================================================
@@ -85,8 +100,8 @@ class Run:
     lora_kmeans_iters: int = LORA_KMEANS_ITERS
     lora_max_rank: int = LORA_MAX_RANK
     lora_min_rank: int = LORA_MIN_RANK
-    lora_rank_interval: int = LORA_RANK_INTERVAL
     lora_quota: Tuple[float, float, float] = field(default_factory=lambda: LORA_QUOTA)
+    lora_rank_lambda: float = LORA_RANK_LAMBDA  # only used when lora_rank_threshold == "learned"
 
 
 def build_runs() -> List[Run]:
@@ -106,7 +121,7 @@ def build_runs() -> List[Run]:
                 ))
 
         if RUN_LORA_STATIC:
-            for rank in [2, 16]:
+            for rank in LORA_STATIC_RANKS:
                 runs.append(Run(
                     label=f"{result_base} | lora_static rank={rank} sh={LORA_SH_DEGREE}",
                     data_dir=Path(data_dir),
@@ -134,7 +149,13 @@ def build_runs() -> List[Run]:
     return runs
 
 
-def run_training(run: Run, dry_run: bool = False) -> bool:
+def run_training(run: Run, dry_run: bool = False, eval_only: bool = False) -> bool:
+    if eval_only:
+        ckpt_path = run.result_dir / "ckpts" / f"ckpt_{MAX_STEPS - 1}_rank0.pt"
+        if not ckpt_path.exists():
+            print(f"  [skip] no checkpoint at {ckpt_path}")
+            return True
+
     cmd = [
         sys.executable, "simple_trainer.py", "default",
         "--data_dir",    str(run.data_dir),
@@ -157,7 +178,6 @@ def run_training(run: Run, dry_run: bool = False) -> bool:
             "--lora_mode", "dynamic",
             "--lora_max_rank",       str(run.lora_max_rank),
             "--lora_min_rank",       str(run.lora_min_rank),
-            "--lora_rank_interval",  str(run.lora_rank_interval),
             "--lora_quota",          str(run.lora_quota[0]),
                                      str(run.lora_quota[1]),
                                      str(run.lora_quota[2]),
@@ -167,8 +187,14 @@ def run_training(run: Run, dry_run: bool = False) -> bool:
             "--lora_warmup_cycles",  str(run.lora_warmup_cycles),
             "--lora_kmeans_iters",   str(run.lora_kmeans_iters),
         ]
+        # Only pass lora_rank_lambda for "learned" threshold (ignored by others but kept clean)
+        if run.lora_rank_threshold == "learned":
+            cmd += ["--lora_rank_lambda", str(run.lora_rank_lambda)]
     else:  # "none"
         cmd += ["--lora_mode", "none"]  # explicit; trainer default is also "none"
+
+    if eval_only:
+        cmd += ["--ckpt", str(ckpt_path)]
 
     print("\n" + "=" * 60)
     print(f"  {run.label}")
@@ -195,7 +221,7 @@ def main() -> None:
     failures: List[str] = []
     for i, run in enumerate(runs, 1):
         print(f"\n[{i}/{len(runs)}]")
-        ok = run_training(run, dry_run=dry_run)
+        ok = run_training(run, dry_run=dry_run, eval_only=EVAL_ONLY)
         if not ok:
             print(f"  WARNING: run failed — {run.result_dir}")
             failures.append(run.label)

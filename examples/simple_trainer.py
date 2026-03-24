@@ -220,10 +220,16 @@ class Config:
     #   "percentile" — fixed quota fractions (lora_quota)
     #   "stats"      — mean ± lora_stats_k * std
     #   "kmeans"     — 1-D k-means (3 centroids)
+    #   "gmm"        — 1-D Gaussian Mixture Model (3 components, EM)
+    #   "learned"    — end-to-end learned nested column gates + rank regularization
+    #                  (lora_rank_strategy is ignored; lora_rank_lambda controls the trade-off)
     lora_rank_threshold: str = "percentile"
     lora_stats_k: float = 1.0
-    # Number of EM iterations for the "kmeans" threshold mode
+    # Number of EM iterations for "kmeans" and "gmm" threshold modes
     lora_kmeans_iters: int = 10
+    # Rank regularization weight for "learned" threshold mode.
+    # Higher value → stronger pressure toward lower rank; lower → prioritize quality.
+    lora_rank_lambda: float = 0.01
     # sh_energy warmup: for the first lora_warmup_cycles rank-adjustment
     # intervals, use sh_energy scoring regardless of lora_rank_strategy.
     # This avoids noisy gradient-based decisions before lora_A has learned
@@ -274,6 +280,7 @@ def create_splats_with_optimizers(
     sh_degree: int = 3,
     lora_rank: int = 16,  # OUR CHANGE: Maximum LoRA rank for SH correction
     lora_mode: str = "none",  # OUR CHANGE: LoRA mode ("none" | "static" | "dynamic")
+    lora_learned: bool = False,  # OUR CHANGE: allocate per-Gaussian column gates for "learned" threshold
     sparse_grad: bool = False,
     visible_adam: bool = False,
     batch_size: int = 1,
@@ -331,6 +338,17 @@ def create_splats_with_optimizers(
             params.append(("current_ranks", torch.nn.Parameter(current_ranks, requires_grad=False), 0.0))
             lora_grad_accum = torch.zeros((N, 1))
             params.append(("lora_grad_accum", torch.nn.Parameter(lora_grad_accum, requires_grad=False), 0.0))
+            if lora_learned:
+                # OUR CHANGE: Per-Gaussian nested column gates for "learned" threshold mode.
+                # Shape [N, lora_rank] — same width as lora_A so each gate controls one column.
+                # Initialized to 0 → sigmoid(0) = 0.5 for all gates, so the cumprod mask
+                # starts with an exponential decay (column 0 ≈ 0.5, column 1 ≈ 0.25, …)
+                # giving the model a gentle low-rank bias from the start.
+                # We give these their own SGD (no-momentum) optimizer rather than Adam —
+                # plain SGD has zero optimizer state (no m1/m2 tensors), saving ×3 memory
+                # vs Adam while still satisfying the strategy's sanity check.
+                lora_col_gates = torch.zeros((N, lora_rank))
+                params.append(("lora_col_gates", torch.nn.Parameter(lora_col_gates), shN_lr))
     else:
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
@@ -351,16 +369,27 @@ def create_splats_with_optimizers(
         optimizer_class = SelectiveAdam
     else:
         optimizer_class = torch.optim.Adam
-    optimizers = {
-        name: optimizer_class(
-            [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
-            eps=1e-15 / math.sqrt(BS),
-            # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
-            betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
-            fused=True,
-        )
-        for name, param, lr in params if param.requires_grad  # OUR CHANGE: skip current_ranks (requires_grad=False)
-    }
+    # OUR CHANGE: "lora_col_gates" uses plain SGD (no momentum) instead of Adam.
+    # Plain SGD has zero optimizer state — no m1/m2 tensors — so it costs only 1×
+    # the parameter memory vs Adam's 3×. It still satisfies the strategy sanity check
+    # (every requires_grad param has an optimizer) and densification resizes it correctly.
+    optimizers = {}
+    for name, param, lr in params:
+        if not param.requires_grad:
+            continue
+        if name == "lora_col_gates":
+            # SGD with no momentum: zero extra state, ~same behavior as manual grad step
+            optimizers[name] = torch.optim.SGD(
+                [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}]
+            )
+        else:
+            optimizers[name] = optimizer_class(
+                [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
+                eps=1e-15 / math.sqrt(BS),
+                # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
+                betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+                fused=True,
+            )
     return splats, optimizers
 
 
@@ -460,6 +489,8 @@ class Runner:
             sh_degree=cfg.sh_degree,
             lora_rank=_lora_rank_init,  # OUR CHANGE: pass LoRA rank
             lora_mode=cfg.lora_mode,    # OUR CHANGE: pass LoRA mode
+            # OUR CHANGE: allocate lora_col_gates only for dynamic+learned — avoids memory waste for other modes
+            lora_learned=(cfg.lora_mode == "dynamic" and cfg.lora_rank_threshold == "learned"),
             sparse_grad=cfg.sparse_grad,
             visible_adam=cfg.visible_adam,
             batch_size=cfg.batch_size,
@@ -676,18 +707,28 @@ class Runner:
                     # Fixed-rank: all Gaussians use the same rank
                     shN_computed = torch.matmul(self.splats["lora_A"], self.lora_B)
                 else:  # dynamic
-                    # OUR CHANGE: Quantized Dynamic LoRA — per-Gaussian rank via discrete bucket GEMMs
-                    buckets = self.cfg.lora_rank_buckets
-                    shN_computed = torch.zeros(
-                        (self.splats["lora_A"].shape[0], self.lora_B.shape[1]),
-                        device=self.device,
-                    )
-                    ranks_sq = self.splats["current_ranks"].squeeze()
-                    for r in buckets:
-                        mask_r = (ranks_sq == r)
-                        if not mask_r.any():
-                            continue
-                        shN_computed[mask_r] = self.splats["lora_A"][mask_r, :r] @ self.lora_B[:r, :]
+                    if self.cfg.lora_rank_threshold == "learned":
+                        # OUR CHANGE: Learned nested column gates.
+                        # ordered_mask[n, k] = sigmoid(g_0) * … * sigmoid(g_k)
+                        # → column k is only active when all lower columns are also active (nesting).
+                        # The soft mask is differentiable, so the loss gradient flows into lora_col_gates.
+                        ordered_mask = torch.cumprod(
+                            torch.sigmoid(self.splats["lora_col_gates"]), dim=1
+                        )  # [N, max_rank]
+                        shN_computed = (self.splats["lora_A"] * ordered_mask) @ self.lora_B
+                    else:
+                        # OUR CHANGE: Quantized Dynamic LoRA — per-Gaussian rank via discrete bucket GEMMs
+                        buckets = self.cfg.lora_rank_buckets
+                        shN_computed = torch.zeros(
+                            (self.splats["lora_A"].shape[0], self.lora_B.shape[1]),
+                            device=self.device,
+                        )
+                        ranks_sq = self.splats["current_ranks"].squeeze()
+                        for r in buckets:
+                            mask_r = (ranks_sq == r)
+                            if not mask_r.any():
+                                continue
+                            shN_computed[mask_r] = self.splats["lora_A"][mask_r, :r] @ self.lora_B[:r, :]
                 shN_computed = shN_computed.view(-1, shN_bands, 3)
                 colors = torch.cat([self.splats["sh0"], shN_computed], 1)  # [N, K, 3]
 
@@ -933,6 +974,12 @@ class Runner:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
 
+            # OUR CHANGE: zero GT background pixels to match what rasterize_splats
+            # does to the render — ensures loss=0 for background so background
+            # Gaussians lose gradient signal and become transparent via pruning.
+            if masks is not None:
+                pixels = pixels * masks.unsqueeze(-1).float()
+
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
                 optimizers=self.optimizers,
@@ -983,27 +1030,61 @@ class Runner:
             if cfg.scale_reg > 0.0:
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
 
+            # OUR CHANGE: Rank regularization for "learned" gate mode.
+            # sigmoid(gates).sum(dim=1) = expected number of active columns per Gaussian (∈ [0, max_rank]).
+            # Dividing by max_rank normalizes to [0, 1]. Adding to loss and minimizing pushes gates
+            # downward (fewer active columns = lower rank). The MSE gradient opposes this for columns
+            # that genuinely improve reconstruction. lora_rank_lambda controls the trade-off.
+            if cfg.lora_mode == "dynamic" and cfg.lora_rank_threshold == "learned":
+                rank_reg_loss = (
+                    cfg.lora_rank_lambda
+                    * torch.sigmoid(self.splats["lora_col_gates"]).sum(dim=1).mean()
+                    / cfg.lora_max_rank
+                )
+                loss = loss + rank_reg_loss
+            else:
+                rank_reg_loss = None
+
             loss.backward()
 
             # OUR CHANGE: Quantized Dynamic LoRA Rank Adjustment
             if cfg.lora_mode == "dynamic":
-                with torch.no_grad():
-                    if self.splats["lora_A"].grad is not None:
-                        self.splats["lora_grad_accum"].add_(
-                            self.splats["lora_A"].grad.abs().sum(dim=-1, keepdim=True)
-                        )
-
                 allocation_interval = len(self.trainset)
                 if hasattr(self.cfg.strategy, "refine_stop_iter"):
                     freeze_step = self.cfg.strategy.refine_stop_iter
                 else:
                     freeze_step = 15000
 
-                if step > 0 and step % allocation_interval == 0 and step <= freeze_step:
-                    score = self._compute_lora_rank_score()
-                    if score is not None:
-                        self._apply_lora_rank_buckets(score)
-                        self.splats["lora_grad_accum"].zero_()
+                if cfg.lora_rank_threshold == "learned":
+                    # OUR CHANGE: For "learned" mode, rank assignment is continuous (gates update
+                    # every step via backward). We only need to periodically refresh current_ranks
+                    # from the hard-thresholded gates so that logging and heatmaps stay accurate.
+                    if step > 0 and step % allocation_interval == 0:
+                        with torch.no_grad():
+                            ordered_mask = torch.cumprod(
+                                torch.sigmoid(self.splats["lora_col_gates"]), dim=1
+                            )
+                            # Count how many leading columns have mask > 0.5 per Gaussian
+                            hard_counts = (ordered_mask > 0.5).sum(dim=1).clamp(min=1).float()
+                            # Snap to nearest rank bucket
+                            buckets = torch.tensor(
+                                cfg.lora_rank_buckets, device=self.device, dtype=torch.float
+                            )
+                            bucket_idx = (hard_counts.unsqueeze(1) - buckets.unsqueeze(0)).abs().argmin(dim=1)
+                            self.splats["current_ranks"].data = buckets[bucket_idx].unsqueeze(1)
+                else:
+                    # Score-based methods: accumulate gradients, then threshold into buckets each epoch
+                    with torch.no_grad():
+                        if self.splats["lora_A"].grad is not None:
+                            self.splats["lora_grad_accum"].add_(
+                                self.splats["lora_A"].grad.abs().sum(dim=-1, keepdim=True)
+                            )
+
+                    if step > 0 and step % allocation_interval == 0 and step <= freeze_step:
+                        score = self._compute_lora_rank_score()
+                        if score is not None:
+                            self._apply_lora_rank_buckets(score)
+                            self.splats["lora_grad_accum"].zero_()
 
             # OUR CHANGE: Periodic rank heatmap during training (only for LoRA modes)
             if (world_rank == 0 and cfg.lora_mode != "none" and cfg.lora_heatmap_interval > 0
@@ -1058,6 +1139,9 @@ class Runner:
                     grad_frustration = grad_sum / (self.splats["current_ranks"].data.squeeze() + 1e-8)
                     self.writer.add_scalar("lora/avg_grad_frustration", grad_frustration.mean().item(), step)
                     self.writer.add_scalar("lora/avg_rank", self.splats["current_ranks"].float().mean().item(), step)
+                    # OUR CHANGE: log rank regularization loss for "learned" mode
+                    if rank_reg_loss is not None:
+                        self.writer.add_scalar("lora/rank_reg_loss", rank_reg_loss.item(), step)
                 self.writer.flush()
 
             # save checkpoint before updating the model
@@ -1126,10 +1210,17 @@ class Runner:
                         shN = shN_computed.view(-1, shN_bands, 3)
                     else:  # dynamic
                         shN_bands = (self.cfg.sh_degree + 1) ** 2 - 1
-                        rank_idx = torch.arange(self.cfg.lora_max_rank, device=self.device)
-                        rank_mask = (rank_idx < self.splats["current_ranks"]).float()
-                        lora_A = self.splats["lora_A"] * rank_mask
-                        shN_computed = torch.matmul(lora_A, self.lora_B)
+                        if cfg.lora_rank_threshold == "learned":
+                            # OUR CHANGE: use the same ordered_mask as the forward pass for export
+                            ordered_mask = torch.cumprod(
+                                torch.sigmoid(self.splats["lora_col_gates"]), dim=1
+                            )
+                            shN_computed = (self.splats["lora_A"] * ordered_mask) @ self.lora_B
+                        else:
+                            rank_idx = torch.arange(self.cfg.lora_max_rank, device=self.device)
+                            rank_mask = (rank_idx < self.splats["current_ranks"]).float()
+                            lora_A = self.splats["lora_A"] * rank_mask
+                            shN_computed = torch.matmul(lora_A, self.lora_B)
                         shN = shN_computed.view(-1, shN_bands, 3)
 
                 means = self.splats["means"]
@@ -1174,7 +1265,14 @@ class Runner:
 
             # OUR CHANGE: Gradient clipping for LoRA parameters
             if cfg.lora_mode != "none" and self.splats["lora_A"].grad is not None and self.lora_B.grad is not None:
-                torch.nn.utils.clip_grad_norm_([self.splats["lora_A"], self.lora_B], max_norm=1.0)
+                params_to_clip = [self.splats["lora_A"], self.lora_B]
+                # OUR CHANGE: also clip lora_col_gates gradient when in "learned" mode
+                if (cfg.lora_rank_threshold == "learned"
+                        and "lora_col_gates" in self.splats
+                        and self.splats["lora_col_gates"].grad is not None):
+                    params_to_clip.append(self.splats["lora_col_gates"])
+                torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=1.0)
+
 
             # optimize
             for optimizer in self.optimizers.values():
@@ -1290,6 +1388,10 @@ class Runner:
 
             colors = torch.clamp(colors, 0.0, 1.0)
 
+            # OUR CHANGE: mask GT so metrics and saved images compare only foreground
+            if masks is not None:
+                pixels = pixels * masks.unsqueeze(-1).float()
+
             canvas_list = [pixels, colors]
 
             # OUR CHANGE: Generate the Heatmap (only when LoRA is active)
@@ -1297,6 +1399,9 @@ class Runner:
                 heatmap_colors = self.render_rank_heatmap(
                     camtoworlds=camtoworlds, Ks=Ks, width=width, height=height
                 )
+                # OUR CHANGE: mask background so heatmap only shows foreground Gaussians
+                if masks is not None:
+                    heatmap_colors = heatmap_colors * masks.unsqueeze(-1).float()
                 if world_rank == 0:
                     # OUR CHANGE: Save the LoRA rank heatmap for visualization
                     heatmap_canvas = (heatmap_colors.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
@@ -1316,7 +1421,18 @@ class Runner:
 
                 pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                metrics["psnr"].append(self.psnr(colors_p, pixels_p))
+
+                # OUR CHANGE: for masked scenes compute PSNR only over foreground
+                # pixels so background zeros don't dilute the metric.
+                # SSIM and LPIPS are patch-based; zeroing both sides (done above)
+                # is the standard approach for those.
+                if masks is not None:
+                    fg = masks.unsqueeze(-1).expand_as(colors)  # [1, H, W, 3]
+                    mse = (colors[fg] - pixels[fg]).pow(2).mean()
+                    psnr_val = 10.0 * torch.log10(1.0 / mse.clamp(min=1e-10))
+                    metrics["psnr"].append(psnr_val)
+                else:
+                    metrics["psnr"].append(self.psnr(colors_p, pixels_p))
                 metrics["ssim"].append(self.ssim(colors_p, pixels_p))
                 metrics["lpips"].append(self.lpips(colors_p, pixels_p))
                 # Compute color-corrected metrics for fair comparison across methods
@@ -1326,7 +1442,14 @@ class Runner:
                     else:
                         cc_colors = color_correct_quadratic(colors, pixels)
                     cc_colors_p = cc_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                    metrics["cc_psnr"].append(self.psnr(cc_colors_p, pixels_p))
+                    if masks is not None:
+                        fg = masks.unsqueeze(-1).expand_as(cc_colors)
+                        mse = (cc_colors[fg] - pixels[fg]).pow(2).mean()
+                        metrics["cc_psnr"].append(
+                            10.0 * torch.log10(1.0 / mse.clamp(min=1e-10))
+                        )
+                    else:
+                        metrics["cc_psnr"].append(self.psnr(cc_colors_p, pixels_p))
                     metrics["cc_ssim"].append(self.ssim(cc_colors_p, pixels_p))
                     metrics["cc_lpips"].append(self.lpips(cc_colors_p, pixels_p))
 
@@ -1413,7 +1536,7 @@ class Runner:
             camtoworlds = camtoworlds_all[i : i + 1]
             Ks = K[None]
 
-            renders, _, _ = self.rasterize_splats(
+            renders, alphas, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -1425,6 +1548,15 @@ class Runner:
             )  # [1, H, W, 4]
             colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
             depths = renders[..., 3:4]  # [1, H, W, 1]
+
+            # For masked scenes (object-only, e.g. pitcher), force low-alpha
+            # regions to black so background Gaussians don't pollute the video.
+            has_masks = any(p is not None for p in self.parser.mask_paths)
+            if has_masks:
+                fg_mask = (alphas > 0.5).float()  # [1, H, W, 1]
+                colors = colors * fg_mask
+                depths = depths * fg_mask
+
             depths = (depths - depths.min()) / (depths.max() - depths.min())
             canvas_list = [colors, depths.repeat(1, 1, 1, 3)]
 
@@ -1595,11 +1727,53 @@ class Runner:
         top_thresh    = (sorted_c[1] + sorted_c[2]) / 2.0
         return top_thresh, bottom_thresh
 
+    def _gmm_thresholds(self, score: Tensor, n_iter: int = 20) -> Tuple[Tensor, Tensor]:
+        """1-D Gaussian Mixture Model with 3 components fitted via EM.
+
+        Like kmeans but variance-aware: a tight low-score cluster and a
+        spread high-score tail are modelled separately, so the boundaries
+        adapt to the actual shape of the distribution rather than just the
+        centroid positions.
+
+        Returns (top_thresh, bottom_thresh) — midpoints between sorted
+        component means, same interface as _kmeans_thresholds.
+        """
+        s = score.float().squeeze()  # [N]
+        N = s.shape[0]
+
+        # Initialise means at quartiles, shared variance, uniform weights
+        means   = torch.quantile(s, torch.tensor([0.25, 0.5, 0.75], device=s.device))
+        vars_   = torch.full((3,), s.var().clamp(min=1e-6).item(), device=s.device)
+        weights = torch.full((3,), 1.0 / 3.0, device=s.device)
+
+        for _ in range(n_iter):
+            # E-step: log-responsibilities [N, 3]
+            diff     = s.unsqueeze(1) - means.unsqueeze(0)           # [N, 3]
+            log_resp = (
+                -0.5 * diff ** 2 / vars_.unsqueeze(0)
+                - 0.5 * vars_.log().unsqueeze(0)
+                + weights.log().unsqueeze(0)
+            )
+            log_resp = log_resp - torch.logsumexp(log_resp, dim=1, keepdim=True)
+            resp     = log_resp.exp()                                  # [N, 3]
+
+            # M-step
+            Nk      = resp.sum(dim=0).clamp(min=1e-6)                 # [3]
+            means   = (resp * s.unsqueeze(1)).sum(dim=0) / Nk
+            diff    = s.unsqueeze(1) - means.unsqueeze(0)
+            vars_   = ((resp * diff ** 2).sum(dim=0) / Nk).clamp(min=1e-6)
+            weights = Nk / N
+
+        sorted_means, _ = means.sort()
+        bottom_thresh = (sorted_means[0] + sorted_means[1]) / 2.0
+        top_thresh    = (sorted_means[1] + sorted_means[2]) / 2.0
+        return top_thresh, bottom_thresh
+
     def _apply_lora_rank_buckets(self, score: Tensor) -> None:
         """Assign each Gaussian to a rank bucket based on its score,
         then re-initialize demoted lora_A columns and zero their momentum.
 
-        Two threshold modes (cfg.lora_rank_threshold):
+        Threshold modes (cfg.lora_rank_threshold):
           "percentile": fixed quota fractions from cfg.lora_quota
               top    lora_quota[0] fraction  -> highest bucket
               middle lora_quota[1] fraction  -> middle bucket
@@ -1608,6 +1782,8 @@ class Runner:
               score > mean + k*std  -> highest bucket
               score < mean - k*std  -> lowest bucket
               everything else       -> middle bucket
+          "kmeans": data-driven via 1-D k-means (3 centroids)
+          "gmm":    data-driven via 1-D Gaussian Mixture Model (3 components)
         """
         cfg = self.cfg
 
@@ -1623,10 +1799,14 @@ class Runner:
             top_thresh, bottom_thresh = self._kmeans_thresholds(
                 score, n_iter=cfg.lora_kmeans_iters
             )
+        elif cfg.lora_rank_threshold == "gmm":
+            top_thresh, bottom_thresh = self._gmm_thresholds(
+                score, n_iter=cfg.lora_kmeans_iters
+            )
         else:
             raise ValueError(
                 f"Unknown lora_rank_threshold: {cfg.lora_rank_threshold!r}. "
-                "Choose 'percentile', 'stats', or 'kmeans'."
+                "Choose 'percentile', 'stats', 'kmeans', or 'gmm'."
             )
 
         top_mask    = score >= top_thresh
