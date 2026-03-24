@@ -258,7 +258,23 @@ class Parser:
         self.Ks_dict = Ks_dict  # Dict of camera_id -> K
         self.params_dict = params_dict  # Dict of camera_id -> params
         self.imsize_dict = imsize_dict  # Dict of camera_id -> (width, height)
-        self.mask_dict = mask_dict  # Dict of camera_id -> mask
+        self.mask_dict = mask_dict  # Dict of camera_id -> mask (fisheye ROI)
+
+        # Per-image masks from masks/ directory (e.g. object segmentation masks).
+        # mask_paths[i] is the path to the mask for image_paths[i], or None.
+        per_image_mask_dir = os.path.join(data_dir, "masks")
+        if os.path.exists(per_image_mask_dir):
+            mask_files = {
+                os.path.splitext(f)[0]: os.path.join(per_image_mask_dir, f)
+                for f in os.listdir(per_image_mask_dir)
+            }
+            self.mask_paths = [
+                mask_files.get(os.path.splitext(os.path.basename(p))[0])
+                for p in image_paths
+            ]
+            print(f"[Parser] Found masks/ directory — loaded {sum(m is not None for m in self.mask_paths)}/{len(image_paths)} per-image masks.")
+        else:
+            self.mask_paths = [None] * len(image_paths)
         self.points = points  # np.ndarray, (num_points, 3)
         self.points_err = points_err  # np.ndarray, (num_points,)
         self.points_rgb = points_rgb  # np.ndarray, (num_points, 3)
@@ -447,7 +463,16 @@ class Dataset:
                 index
             ],  # 0-based contiguous camera index
         }
-        if mask is not None:
+        mask_path = self.parser.mask_paths[index]
+        if mask_path is not None:
+            mask_img = imageio.imread(mask_path)
+            h, w = image.shape[:2]
+            if mask_img.shape[:2] != (h, w):
+                mask_img = np.array(
+                    Image.fromarray(mask_img).resize((w, h), Image.NEAREST)
+                )
+            data["mask"] = torch.from_numpy(mask_img > 128).bool()
+        elif mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
 
         # Add exposure if available for this image
