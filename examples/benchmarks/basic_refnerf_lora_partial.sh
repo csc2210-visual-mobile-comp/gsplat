@@ -7,7 +7,7 @@ SCENE_LIST="sedan"
 RENDER_TRAJ_PATH="ellipse"
 
 CONFIG_NAME="default"
-LORA_RANK=64
+LORA_RANK=32
 
 # Define LoRA target combinations
 LORA_TARGET_SETS=(
@@ -50,17 +50,10 @@ for SCENE in $SCENE_LIST; do
             --lora-rank "$LORA_RANK" \
             --lora-target "${TARGET_ARRAY[@]}"
 
-        for CKPT in "${SCENE_RESULT_DIR}"/ckpts/*.pt; do
-            CUDA_VISIBLE_DEVICES=0 python partial_lora_trainer.py "$CONFIG_NAME" \
-                --disable-viewer \
-                --data-factor "$DATA_FACTOR" \
-                --render-traj-path "$RENDER_TRAJ_PATH" \
-                --data-dir "${SCENE_DIR}/${SCENE}/" \
-                --result-dir "$SCENE_RESULT_DIR" \
-                --lora-rank "$LORA_RANK" \
-                --lora-target "${TARGET_ARRAY[@]}" \
-                --ckpt "$CKPT"
-        done
+        OUT="${SCENE_RESULT_DIR}"
+
+        echo "=== Cleaning up ckpts/ and renders/ for $OUT ==="
+        rm -rf "$OUT/ckpts/" "$OUT/renders/"
     done
 done
 
