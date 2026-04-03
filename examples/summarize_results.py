@@ -23,13 +23,14 @@ import torch
 # Each entry: (data_dir, result_base_dir, data_factor)
 SCENES: List[Tuple[str, str, int]] = [
     ("data/sedan", "results/sedan_f4", 4),
-    ("data/sedan", "results/sedan_f2", 2),
+    # ("data/sedan", "results/sedan_f2", 2),
     # ("data/pitcher_scene007", "results/pitcher_scene007", 1),
 ]
 # ─────────────────────────────────────────────────────────────────────────────
 
 METRICS = ["psnr", "ssim", "lpips"]
 OPTIONAL_METRICS = ["cc_psnr", "cc_ssim", "cc_lpips", "avg_rank", "num_GS"]
+TRAIN_METRICS = ["train_mem_gb"]  # sourced from train_step*.json
 
 
 def load_val_stats(result_dir: Path) -> Optional[Dict]:
@@ -38,6 +39,17 @@ def load_val_stats(result_dir: Path) -> Optional[Dict]:
     if not stats_dir.exists():
         return None
     files = sorted(stats_dir.glob("val_step*.json"))
+    if not files:
+        return None
+    return json.loads(files[-1].read_text())
+
+
+def load_train_stats(result_dir: Path) -> Optional[Dict]:
+    """Return the last train_step*.json found in result_dir/stats/, or None."""
+    stats_dir = result_dir / "stats"
+    if not stats_dir.exists():
+        return None
+    files = sorted(stats_dir.glob("train_step*.json"))
     if not files:
         return None
     return json.loads(files[-1].read_text())
@@ -75,10 +87,11 @@ def collect_rows(result_base: Path) -> List[Dict]:
         if not exp_dir.is_dir():
             continue
         stats = load_val_stats(exp_dir)
+        train_stats = load_train_stats(exp_dir)
         row = {"experiment": exp_dir.name}
         if stats is None:
             row["status"] = "missing"
-            for m in METRICS + OPTIONAL_METRICS:
+            for m in METRICS + OPTIONAL_METRICS + TRAIN_METRICS:
                 row[m] = ""
         else:
             row["status"] = "ok"
@@ -92,6 +105,9 @@ def collect_rows(result_base: Path) -> List[Dict]:
                     row[m] = str(int(val))
                 else:
                     row[m] = f"{val:.4f}"
+            # Peak GPU memory from training stats (separate JSON file)
+            mem = (train_stats or {}).get("mem")
+            row["train_mem_gb"] = f"{mem:.2f}" if mem is not None else ""
         rank_dist = load_rank_dist(exp_dir)
         row["_rank_dist"] = rank_dist  # raw dict, used to build dynamic columns
         rows.append(row)
@@ -122,7 +138,7 @@ def print_table(result_base: str, rows: List[Dict], rank_cols: List[str]) -> Non
         print(f"\n[{result_base}] — no results found")
         return
 
-    cols = ["experiment", "status"] + METRICS + OPTIONAL_METRICS + rank_cols
+    cols = ["experiment", "status"] + METRICS + OPTIONAL_METRICS + TRAIN_METRICS + rank_cols
     widths = {c: len(c) for c in cols}
     for row in rows:
         for c in cols:
@@ -141,7 +157,7 @@ def print_table(result_base: str, rows: List[Dict], rank_cols: List[str]) -> Non
 
 
 def write_csv(csv_path: Path, rows: List[Dict], rank_cols: List[str]) -> None:
-    cols = ["experiment", "status"] + METRICS + OPTIONAL_METRICS + rank_cols
+    cols = ["experiment", "status"] + METRICS + OPTIONAL_METRICS + TRAIN_METRICS + rank_cols
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         writer.writeheader()

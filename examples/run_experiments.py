@@ -31,8 +31,8 @@ from typing import List, Optional, Tuple
 #   data_factor 1 = original resolution, 4 = images_4 downsampled
 SCENES: List[Tuple[str, str, int]] = [
     ("data/sedan", "results/sedan_f4", 4),
-    ("data/sedan", "results/sedan_f2", 2),
-    ("data/pitcher_scene001", "results/pitcher_scene001", 1),
+    # ("data/sedan", "results/sedan_f2", 2),
+    # ("data/pitcher_scene001", "results/pitcher_scene001", 1),
 ]
 
 # Training duration
@@ -59,9 +59,9 @@ LORA_QUOTA: Tuple[float, float, float] = (0.4, 0.4, 0.2)
 LORA_STATS_K:       float = 1.0
 LORA_WARMUP_CYCLES: int   = 5
 LORA_KMEANS_ITERS:  int   = 10
-# Rank regularization weight for "learned" threshold mode (λ in MSE + λ·rank_penalty).
-# Higher → stronger pressure toward lower rank; lower → prioritize quality.
-LORA_RANK_LAMBDA:   float = 0.01
+# Lambda sweep for "learned" threshold mode (λ in MSE + λ·rank_penalty).
+# Each value produces a separate run. Higher → more pressure toward lower rank.
+LORA_RANK_LAMBDAS: List[float] = [ 0.01, 0.1]
 
 # Each entry: (strategy, threshold)
 #   strategy  : "gradient" | "opacity_grad" | "sh_energy" | "none" (for "learned")
@@ -76,7 +76,7 @@ LORA_DYNAMIC_CONFIGS: List[Tuple[str, str]] = [
     # ("sh_energy",    "percentile"),
     # ("sh_energy",    "kmeans"),
     # ("sh_energy",    "gmm"),
-    ("none",         "learned"),   # end-to-end learned gates; strategy is unused
+    ("none",         "learned_buckets"),   # end-to-end learned bucket assignment; strategy is unused
 ]
 
 # =============================================================================
@@ -101,7 +101,7 @@ class Run:
     lora_max_rank: int = LORA_MAX_RANK
     lora_min_rank: int = LORA_MIN_RANK
     lora_quota: Tuple[float, float, float] = field(default_factory=lambda: LORA_QUOTA)
-    lora_rank_lambda: float = LORA_RANK_LAMBDA  # only used when lora_rank_threshold == "learned"
+    lora_rank_lambda: float = LORA_RANK_LAMBDAS[0]  # only used when lora_rank_threshold == "learned"
 
 
 def build_runs() -> List[Run]:
@@ -135,16 +135,43 @@ def build_runs() -> List[Run]:
         if RUN_LORA_DYNAMIC:
             quota_tag = "_".join(str(int(q * 10)) for q in LORA_QUOTA)
             for (strategy, threshold) in LORA_DYNAMIC_CONFIGS:
-                runs.append(Run(
-                    label=f"{result_base} | lora_dynamic {strategy}/{threshold} quota={quota_tag} max={LORA_MAX_RANK} sh={LORA_SH_DEGREE}",
-                    data_dir=Path(data_dir),
-                    result_dir=base / f"lora_dynamic_{strategy}_{threshold}_q{quota_tag}_max{LORA_MAX_RANK}",
-                    data_factor=data_factor,
-                    sh_degree=LORA_SH_DEGREE,
-                    lora_mode="dynamic",
-                    lora_rank_strategy=strategy,
-                    lora_rank_threshold=threshold,
-                ))
+                if threshold == "learned_buckets":
+                    # One run per lambda value in LORA_RANK_LAMBDAS
+                    for lam in LORA_RANK_LAMBDAS:
+                        param_tag = f"_lam{lam}"
+                        dir_name = f"lora_dynamic_{strategy}_{threshold}{param_tag}_max{LORA_MAX_RANK}"
+                        label = f"{result_base} | lora_dynamic {strategy}/{threshold}{param_tag} max={LORA_MAX_RANK} sh={LORA_SH_DEGREE}"
+                        runs.append(Run(
+                            label=label,
+                            data_dir=Path(data_dir),
+                            result_dir=base / dir_name,
+                            data_factor=data_factor,
+                            sh_degree=LORA_SH_DEGREE,
+                            lora_mode="dynamic",
+                            lora_rank_strategy=strategy,
+                            lora_rank_threshold=threshold,
+                            lora_rank_lambda=lam,
+                        ))
+                else:
+                    # Single run; tag carries the parameter relevant to this threshold
+                    if threshold == "percentile":
+                        param_tag = f"_q{quota_tag}"
+                    elif threshold == "stats":
+                        param_tag = f"_k{LORA_STATS_K}"
+                    else:  # kmeans, gmm
+                        param_tag = ""
+                    dir_name = f"lora_dynamic_{strategy}_{threshold}{param_tag}_max{LORA_MAX_RANK}"
+                    label = f"{result_base} | lora_dynamic {strategy}/{threshold}{param_tag} max={LORA_MAX_RANK} sh={LORA_SH_DEGREE}"
+                    runs.append(Run(
+                        label=label,
+                        data_dir=Path(data_dir),
+                        result_dir=base / dir_name,
+                        data_factor=data_factor,
+                        sh_degree=LORA_SH_DEGREE,
+                        lora_mode="dynamic",
+                        lora_rank_strategy=strategy,
+                        lora_rank_threshold=threshold,
+                    ))
 
     return runs
 
@@ -187,8 +214,8 @@ def run_training(run: Run, dry_run: bool = False, eval_only: bool = False) -> bo
             "--lora_warmup_cycles",  str(run.lora_warmup_cycles),
             "--lora_kmeans_iters",   str(run.lora_kmeans_iters),
         ]
-        # Only pass lora_rank_lambda for "learned" threshold (ignored by others but kept clean)
-        if run.lora_rank_threshold == "learned":
+        # Only pass lora_rank_lambda for "learned_buckets" threshold
+        if run.lora_rank_threshold == "learned_buckets":
             cmd += ["--lora_rank_lambda", str(run.lora_rank_lambda)]
     else:  # "none"
         cmd += ["--lora_mode", "none"]  # explicit; trainer default is also "none"

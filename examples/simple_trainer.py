@@ -219,16 +219,19 @@ class Config:
     # How bucket boundaries are computed:
     #   "percentile" — fixed quota fractions (lora_quota)
     #   "stats"      — mean ± lora_stats_k * std
-    #   "kmeans"     — 1-D k-means (3 centroids)
-    #   "gmm"        — 1-D Gaussian Mixture Model (3 components, EM)
-    #   "learned"    — end-to-end learned nested column gates + rank regularization
-    #                  (lora_rank_strategy is ignored; lora_rank_lambda controls the trade-off)
+    #   "kmeans"          — 1-D k-means (3 centroids)
+    #   "gmm"             — 1-D Gaussian Mixture Model (3 components, EM)
+    #   "learned_buckets" — per-Gaussian 3-way soft rank assignment learned end-to-end.
+    #                       Each Gaussian has 3 logits (one per rank bucket). Forward pass
+    #                       blends all three bucket outputs weighted by softmax(logits).
+    #                       lora_rank_strategy is ignored; lora_rank_lambda controls the
+    #                       regularization pressure toward lower buckets.
     lora_rank_threshold: str = "percentile"
     lora_stats_k: float = 1.0
     # Number of EM iterations for "kmeans" and "gmm" threshold modes
     lora_kmeans_iters: int = 10
-    # Rank regularization weight for "learned" threshold mode.
-    # Higher value → stronger pressure toward lower rank; lower → prioritize quality.
+    # Rank regularization weight for "learned_buckets" mode (λ in MSE + λ·rank_cost).
+    # Higher → stronger pressure toward lower rank buckets; lower → prioritize quality.
     lora_rank_lambda: float = 0.01
     # sh_energy warmup: for the first lora_warmup_cycles rank-adjustment
     # intervals, use sh_energy scoring regardless of lora_rank_strategy.
@@ -280,7 +283,7 @@ def create_splats_with_optimizers(
     sh_degree: int = 3,
     lora_rank: int = 16,  # OUR CHANGE: Maximum LoRA rank for SH correction
     lora_mode: str = "none",  # OUR CHANGE: LoRA mode ("none" | "static" | "dynamic")
-    lora_learned: bool = False,  # OUR CHANGE: allocate per-Gaussian column gates for "learned" threshold
+    lora_learned_buckets: bool = False,  # OUR CHANGE: allocate per-Gaussian rank logits for "learned_buckets"
     sparse_grad: bool = False,
     visible_adam: bool = False,
     batch_size: int = 1,
@@ -338,17 +341,16 @@ def create_splats_with_optimizers(
             params.append(("current_ranks", torch.nn.Parameter(current_ranks, requires_grad=False), 0.0))
             lora_grad_accum = torch.zeros((N, 1))
             params.append(("lora_grad_accum", torch.nn.Parameter(lora_grad_accum, requires_grad=False), 0.0))
-            if lora_learned:
-                # OUR CHANGE: Per-Gaussian nested column gates for "learned" threshold mode.
-                # Shape [N, lora_rank] — same width as lora_A so each gate controls one column.
-                # Initialized to 0 → sigmoid(0) = 0.5 for all gates, so the cumprod mask
-                # starts with an exponential decay (column 0 ≈ 0.5, column 1 ≈ 0.25, …)
-                # giving the model a gentle low-rank bias from the start.
-                # We give these their own SGD (no-momentum) optimizer rather than Adam —
-                # plain SGD has zero optimizer state (no m1/m2 tensors), saving ×3 memory
-                # vs Adam while still satisfying the strategy's sanity check.
-                lora_col_gates = torch.zeros((N, lora_rank))
-                params.append(("lora_col_gates", torch.nn.Parameter(lora_col_gates), shN_lr))
+            if lora_learned_buckets:
+                # OUR CHANGE: Per-Gaussian rank bucket logits for "learned_buckets" mode.
+                # Shape [N, 3] — one logit per rank bucket (low / mid / high).
+                # Initialized to [0, 0, 2]: softmax slightly prefers the highest bucket so
+                # every Gaussian starts at roughly full rank. Regularization then prunes simple
+                # Gaussians toward lower buckets while complex ones (large MSE gradient) stay high.
+                # Uses SGD (no momentum) — zero extra optimizer state vs Adam's m1/m2.
+                rank_logits = torch.zeros((N, 3))
+                rank_logits[:, 2] = 2.0
+                params.append(("rank_logits", torch.nn.Parameter(rank_logits), shN_lr))
     else:
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
@@ -369,16 +371,15 @@ def create_splats_with_optimizers(
         optimizer_class = SelectiveAdam
     else:
         optimizer_class = torch.optim.Adam
-    # OUR CHANGE: "lora_col_gates" uses plain SGD (no momentum) instead of Adam.
-    # Plain SGD has zero optimizer state — no m1/m2 tensors — so it costs only 1×
-    # the parameter memory vs Adam's 3×. It still satisfies the strategy sanity check
-    # (every requires_grad param has an optimizer) and densification resizes it correctly.
+    # OUR CHANGE: "rank_logits" uses plain SGD (no momentum) instead of Adam.
+    # rank_logits is only [N, 3] — tiny — but SGD keeps it consistent: zero extra
+    # optimizer state (no m1/m2), satisfies the strategy sanity check, and densification
+    # resizes it automatically since it lives in self.splats.
     optimizers = {}
     for name, param, lr in params:
         if not param.requires_grad:
             continue
-        if name == "lora_col_gates":
-            # SGD with no momentum: zero extra state, ~same behavior as manual grad step
+        if name == "rank_logits":
             optimizers[name] = torch.optim.SGD(
                 [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}]
             )
@@ -386,7 +387,6 @@ def create_splats_with_optimizers(
             optimizers[name] = optimizer_class(
                 [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
                 eps=1e-15 / math.sqrt(BS),
-                # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
                 betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
                 fused=True,
             )
@@ -489,8 +489,8 @@ class Runner:
             sh_degree=cfg.sh_degree,
             lora_rank=_lora_rank_init,  # OUR CHANGE: pass LoRA rank
             lora_mode=cfg.lora_mode,    # OUR CHANGE: pass LoRA mode
-            # OUR CHANGE: allocate lora_col_gates only for dynamic+learned — avoids memory waste for other modes
-            lora_learned=(cfg.lora_mode == "dynamic" and cfg.lora_rank_threshold == "learned"),
+            # OUR CHANGE: allocate rank_logits only for dynamic+learned_buckets
+            lora_learned_buckets=(cfg.lora_mode == "dynamic" and cfg.lora_rank_threshold == "learned_buckets"),
             sparse_grad=cfg.sparse_grad,
             visible_adam=cfg.visible_adam,
             batch_size=cfg.batch_size,
@@ -707,15 +707,22 @@ class Runner:
                     # Fixed-rank: all Gaussians use the same rank
                     shN_computed = torch.matmul(self.splats["lora_A"], self.lora_B)
                 else:  # dynamic
-                    if self.cfg.lora_rank_threshold == "learned":
-                        # OUR CHANGE: Learned nested column gates.
-                        # ordered_mask[n, k] = sigmoid(g_0) * … * sigmoid(g_k)
-                        # → column k is only active when all lower columns are also active (nesting).
-                        # The soft mask is differentiable, so the loss gradient flows into lora_col_gates.
-                        ordered_mask = torch.cumprod(
-                            torch.sigmoid(self.splats["lora_col_gates"]), dim=1
-                        )  # [N, max_rank]
-                        shN_computed = (self.splats["lora_A"] * ordered_mask) @ self.lora_B
+                    if self.cfg.lora_rank_threshold == "learned_buckets":
+                        # OUR CHANGE: Soft 3-way bucket assignment.
+                        # Each Gaussian blends all three rank-bucket outputs weighted by
+                        # softmax(rank_logits[n]). As training progresses the logits grow
+                        # in magnitude and the mix sharpens toward one bucket per Gaussian.
+                        # Gradient flows independently to each bucket's logit based on how
+                        # much that rank level helps this specific Gaussian's reconstruction.
+                        buckets = self.cfg.lora_rank_buckets  # e.g. (2, 8, 32)
+                        soft_w = torch.softmax(self.splats["rank_logits"], dim=1)  # [N, 3]
+                        shN_computed = torch.zeros(
+                            self.splats["lora_A"].shape[0], self.lora_B.shape[1],
+                            device=self.device,
+                        )
+                        for i, r in enumerate(buckets):
+                            # soft_w[:, i]: [N] weight for bucket i, unsqueezed for broadcast
+                            shN_computed += soft_w[:, i:i+1] * (self.splats["lora_A"][:, :r] @ self.lora_B[:r, :])
                     else:
                         # OUR CHANGE: Quantized Dynamic LoRA — per-Gaussian rank via discrete bucket GEMMs
                         buckets = self.cfg.lora_rank_buckets
@@ -1030,17 +1037,17 @@ class Runner:
             if cfg.scale_reg > 0.0:
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
 
-            # OUR CHANGE: Rank regularization for "learned" gate mode.
-            # sigmoid(gates).sum(dim=1) = expected number of active columns per Gaussian (∈ [0, max_rank]).
-            # Dividing by max_rank normalizes to [0, 1]. Adding to loss and minimizing pushes gates
-            # downward (fewer active columns = lower rank). The MSE gradient opposes this for columns
-            # that genuinely improve reconstruction. lora_rank_lambda controls the trade-off.
-            if cfg.lora_mode == "dynamic" and cfg.lora_rank_threshold == "learned":
-                rank_reg_loss = (
-                    cfg.lora_rank_lambda
-                    * torch.sigmoid(self.splats["lora_col_gates"]).sum(dim=1).mean()
-                    / cfg.lora_max_rank
+            # OUR CHANGE: Rank regularization for "learned_buckets" mode.
+            # Penalizes the expected rank cost: sum over buckets of (soft_weight * bucket_cost).
+            # bucket_cost[b] = rank_b / max_rank normalizes costs to [0, 1].
+            # MSE gradient opposes this for Gaussians that genuinely need higher rank.
+            if cfg.lora_mode == "dynamic" and cfg.lora_rank_threshold == "learned_buckets":
+                bucket_costs = torch.tensor(
+                    [r / cfg.lora_max_rank for r in cfg.lora_rank_buckets],
+                    device=self.device,
                 )
+                soft_w = torch.softmax(self.splats["rank_logits"], dim=1)  # [N, 3]
+                rank_reg_loss = cfg.lora_rank_lambda * (soft_w * bucket_costs).mean()
                 loss = loss + rank_reg_loss
             else:
                 rank_reg_loss = None
@@ -1055,23 +1062,17 @@ class Runner:
                 else:
                     freeze_step = 15000
 
-                if cfg.lora_rank_threshold == "learned":
-                    # OUR CHANGE: For "learned" mode, rank assignment is continuous (gates update
-                    # every step via backward). We only need to periodically refresh current_ranks
-                    # from the hard-thresholded gates so that logging and heatmaps stay accurate.
+                if cfg.lora_rank_threshold == "learned_buckets":
+                    # OUR CHANGE: For "learned_buckets" mode, rank assignment updates every step
+                    # via backward. Periodically refresh current_ranks from the hard argmax of
+                    # rank_logits so that logging and heatmaps stay accurate.
                     if step > 0 and step % allocation_interval == 0:
                         with torch.no_grad():
-                            ordered_mask = torch.cumprod(
-                                torch.sigmoid(self.splats["lora_col_gates"]), dim=1
-                            )
-                            # Count how many leading columns have mask > 0.5 per Gaussian
-                            hard_counts = (ordered_mask > 0.5).sum(dim=1).clamp(min=1).float()
-                            # Snap to nearest rank bucket
+                            hard_idx = self.splats["rank_logits"].argmax(dim=1)
                             buckets = torch.tensor(
                                 cfg.lora_rank_buckets, device=self.device, dtype=torch.float
                             )
-                            bucket_idx = (hard_counts.unsqueeze(1) - buckets.unsqueeze(0)).abs().argmin(dim=1)
-                            self.splats["current_ranks"].data = buckets[bucket_idx].unsqueeze(1)
+                            self.splats["current_ranks"].data = buckets[hard_idx].unsqueeze(1)
                 else:
                     # Score-based methods: accumulate gradients, then threshold into buckets each epoch
                     with torch.no_grad():
@@ -1210,17 +1211,12 @@ class Runner:
                         shN = shN_computed.view(-1, shN_bands, 3)
                     else:  # dynamic
                         shN_bands = (self.cfg.sh_degree + 1) ** 2 - 1
-                        if cfg.lora_rank_threshold == "learned":
-                            # OUR CHANGE: use the same ordered_mask as the forward pass for export
-                            ordered_mask = torch.cumprod(
-                                torch.sigmoid(self.splats["lora_col_gates"]), dim=1
-                            )
-                            shN_computed = (self.splats["lora_A"] * ordered_mask) @ self.lora_B
-                        else:
-                            rank_idx = torch.arange(self.cfg.lora_max_rank, device=self.device)
-                            rank_mask = (rank_idx < self.splats["current_ranks"]).float()
-                            lora_A = self.splats["lora_A"] * rank_mask
-                            shN_computed = torch.matmul(lora_A, self.lora_B)
+                        # For learned_buckets: current_ranks is kept in sync with argmax(rank_logits).
+                        # All dynamic modes use the same current_ranks-based mask for export.
+                        rank_idx = torch.arange(self.cfg.lora_max_rank, device=self.device)
+                        rank_mask = (rank_idx < self.splats["current_ranks"]).float()
+                        lora_A = self.splats["lora_A"] * rank_mask
+                        shN_computed = torch.matmul(lora_A, self.lora_B)
                         shN = shN_computed.view(-1, shN_bands, 3)
 
                 means = self.splats["means"]
@@ -1265,13 +1261,7 @@ class Runner:
 
             # OUR CHANGE: Gradient clipping for LoRA parameters
             if cfg.lora_mode != "none" and self.splats["lora_A"].grad is not None and self.lora_B.grad is not None:
-                params_to_clip = [self.splats["lora_A"], self.lora_B]
-                # OUR CHANGE: also clip lora_col_gates gradient when in "learned" mode
-                if (cfg.lora_rank_threshold == "learned"
-                        and "lora_col_gates" in self.splats
-                        and self.splats["lora_col_gates"].grad is not None):
-                    params_to_clip.append(self.splats["lora_col_gates"])
-                torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_([self.splats["lora_A"], self.lora_B], max_norm=1.0)
 
 
             # optimize
