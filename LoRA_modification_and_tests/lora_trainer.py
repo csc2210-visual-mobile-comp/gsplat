@@ -108,6 +108,9 @@ class Config:
     lora_max_rank: int = 32
     lora_min_rank: int = 2
     lora_quota: Tuple[float, float, float] = (0.2, 0.6, 0.2)
+    # Memory hypothesis probing: print per-step breakdown every mem_probe_every steps.
+    # Set to 0 to disable.
+    mem_probe_every: int = 0
     # Initial opacity of GS
     init_opa: float = 0.1
     # Initial scale of GS
@@ -638,6 +641,8 @@ class Runner:
             # colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
             shN_bands = (self.cfg.sh_degree + 1) ** 2 - 1
 
+            _probe = getattr(self, "_mem_probe_this_step", False)
+
             if self.cfg.disable_dynamic_rank:
                 lora_A = self.splats["lora_A"]
                 shN_computed = torch.matmul(lora_A, self.lora_B)
@@ -645,12 +650,25 @@ class Runner:
                 # OUR CHANGE: Use per-bucket nn.Parameter tensors for lora_A
                 buckets = [self.cfg.lora_min_rank, 8, self.cfg.lora_max_rank]
                 N = self.splats["current_ranks"].shape[0]
+
+                if _probe:
+                    _before_zeros = torch.cuda.memory_allocated()
                 shN_computed = torch.zeros(N, self.lora_B.shape[1], device=self.device)
+                if _probe:
+                    _after_zeros = torch.cuda.memory_allocated()
+                    print(f"  [H1] shN_computed zeros alloc: {(_after_zeros - _before_zeros)/1e6:.1f} MB")
+
                 for r in buckets:
                     idxs = self.lora_A_bucket_indices[r]
                     if len(idxs) == 0:
                         continue
-                    shN_computed[idxs] = self.lora_A_buckets[r] @ self.lora_B[:r, :]
+                    if _probe:
+                        _before_matmul = torch.cuda.memory_allocated()
+                    result = self.lora_A_buckets[r] @ self.lora_B[:r, :]
+                    if _probe:
+                        _after_matmul = torch.cuda.memory_allocated()
+                        print(f"  [H2] bucket r={r} (N={len(idxs)}): matmul alloc {(_after_matmul - _before_matmul)/1e6:.1f} MB")
+                    shN_computed[idxs] = result
 
             shN_computed = shN_computed.view(-1, shN_bands, 3) 
             colors = torch.cat([self.splats["sh0"], shN_computed], 1)  # [N, K, 3]
@@ -1026,6 +1044,16 @@ class Runner:
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
         for step in pbar:
+            self._mem_probe_this_step = (
+                cfg.mem_probe_every > 0 and step % cfg.mem_probe_every == 0
+            )
+            if self._mem_probe_this_step:
+                torch.cuda.synchronize()
+                _step_start_mem = torch.cuda.memory_allocated()
+                _step_start_reserved = torch.cuda.memory_reserved()
+                print(f"\n=== MEM PROBE step={step} ===")
+                print(f"  [START] allocated: {_step_start_mem/1e6:.1f} MB  reserved: {_step_start_reserved/1e6:.1f} MB")
+
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
                     time.sleep(0.01)
@@ -1148,7 +1176,18 @@ class Runner:
             if cfg.scale_reg > 0.0:
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
 
+            if self._mem_probe_this_step:
+                _before_bwd = torch.cuda.memory_allocated()
+                print(f"  [H1] before backward: {_before_bwd/1e6:.1f} MB")
+
             loss.backward()
+
+            if self._mem_probe_this_step:
+                _after_bwd = torch.cuda.memory_allocated()
+                print(f"  [H1] after  backward: {_after_bwd/1e6:.1f} MB  (freed: {(_before_bwd - _after_bwd)/1e6:.1f} MB)")
+                _alloc = torch.cuda.memory_allocated()
+                _reserved = torch.cuda.memory_reserved()
+                print(f"  [H3] allocated: {_alloc/1e6:.1f} MB  reserved: {_reserved/1e6:.1f} MB  fragmented: {(_reserved-_alloc)/1e6:.1f} MB")
 
             # OUR CHANGE: Quantized Dynamic LoRA Rank Adjustment — accumulate per-bucket gradients
             if not cfg.disable_dynamic_rank:
@@ -1465,13 +1504,20 @@ class Runner:
             # OUR CHANGE: Scatter bucket tensors into a temporary dense splat so the
             # densification strategy can resize lora_A values along with other params.
             if not cfg.disable_dynamic_rank:
+                if self._mem_probe_this_step:
+                    _before_scatter = torch.cuda.memory_allocated()
                 _lora_A_dense_for_densification = self._scatter_buckets_to_dense()
                 self.splats["lora_A_dense"] = torch.nn.Parameter(
                     _lora_A_dense_for_densification, requires_grad=False
                 )
+                if self._mem_probe_this_step:
+                    _after_scatter = torch.cuda.memory_allocated()
+                    print(f"  [H4] lora_A_dense scatter alloc: {(_after_scatter - _before_scatter)/1e6:.1f} MB")
 
             # Run post-backward steps after backward and optimizer
             if isinstance(self.cfg.strategy, DefaultStrategy):
+                if self._mem_probe_this_step:
+                    torch.cuda.reset_peak_memory_stats()
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
                     optimizers=self.optimizers,
@@ -1480,6 +1526,10 @@ class Runner:
                     info=info,
                     packed=cfg.packed,
                 )
+                if self._mem_probe_this_step:
+                    _peak = torch.cuda.max_memory_allocated()
+                    _curr = torch.cuda.memory_allocated()
+                    print(f"  [H4] densification peak: {_peak/1e6:.1f} MB  after: {_curr/1e6:.1f} MB  transient: {(_peak-_curr)/1e6:.1f} MB")
             elif isinstance(self.cfg.strategy, MCMCStrategy):
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
@@ -1500,6 +1550,18 @@ class Runner:
                     self._rebuild_buckets_from_dense(self.splats["lora_A_dense"].data)
                 del self.splats["lora_A_dense"]
                 self.N_prev_for_densification = N_current
+
+            if self._mem_probe_this_step:
+                torch.cuda.synchronize()
+                _end_alloc = torch.cuda.memory_allocated()
+                _end_reserved = torch.cuda.memory_reserved()
+                print(f"  [END]  allocated: {_end_alloc/1e6:.1f} MB  reserved: {_end_reserved/1e6:.1f} MB")
+                print(f"  [H3]  fragmented (reserved-allocated): {(_end_reserved - _end_alloc)/1e6:.1f} MB")
+                print(f"  [H3]  try empty_cache...")
+                torch.cuda.empty_cache()
+                _after_cache = torch.cuda.memory_reserved()
+                print(f"  [H3]  reserved after empty_cache: {_after_cache/1e6:.1f} MB  (released: {(_end_reserved - _after_cache)/1e6:.1f} MB)")
+                print(f"  [NET] step delta: {(_end_alloc - _step_start_mem)/1e6:.1f} MB")
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
