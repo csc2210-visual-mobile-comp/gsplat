@@ -199,6 +199,13 @@ class Config:
     with_ut: bool = False
     with_eval3d: bool = False
 
+    # LoRA rank for SH color low-rank decomposition
+    lora_rank: Optional[int] = None
+    # Learning rate for LoRA parameters
+    lora_lr: float = 2.5e-3
+    # If True, use append mode: shN is computed entirely from A@B (no additive residual on existing shN)
+    lora_append: bool = False
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -247,7 +254,8 @@ def create_splats_with_optimizers(
     world_rank: int = 0,
     world_size: int = 1,
     lora_rank: Optional[int] = None,
-    lora_lr: float = 2.5e-3
+    lora_lr: float = 2.5e-3,
+    lora_append: bool = False,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer], torch.nn.Parameter, torch.optim.Optimizer]:
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
@@ -435,6 +443,9 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
+            lora_rank=cfg.lora_rank,
+            lora_lr=cfg.lora_lr,
+            lora_append=cfg.lora_append,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
@@ -614,9 +625,16 @@ class Runner:
             colors = colors + self.splats["colors"]
             colors = torch.sigmoid(colors)
         else:
-            colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
-            N, K, d = colors.shape
-            colors += (self.splats["A"] @ self.B).view(N, K, d)
+            if self.cfg.lora_append:
+                N, _, _ = self.splats["sh0"].shape
+                lora_dim, d = self.B.shape
+                K = d // 3
+                shN = (self.splats["A"] @ self.B[:, :-3]).view(N, K - 1, 3)
+                colors = torch.cat([self.splats["sh0"], shN], 1)  # [N, K, 3]
+            else:
+                colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
+                N, K, d = colors.shape
+                colors += (self.splats["A"] @ self.B).view(N, K, d)
 
         if rasterize_mode is None:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
