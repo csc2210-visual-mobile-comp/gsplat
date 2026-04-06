@@ -1,14 +1,14 @@
 SCENE_DIR="data/refnerf"
-SCENE_LIST="sedan"
+SCENE_LIST="gardenspheres sedan toycar"
 LORA_RANK=32
 
 for MODE in "add" "append"; do
     if [ "$MODE" = "append" ]; then
         LORA_APPEND_FLAG="--lora_append"
-        RESULT_DIR="results/benchmark/lora_append"
+        RESULT_DIR="results/benchmark/lora_colors_only/lora_append"
     else
         LORA_APPEND_FLAG=""
-        RESULT_DIR="results/benchmark/lora_add"
+        RESULT_DIR="results/benchmark/lora_colors_only/lora_add"
     fi
 
     for SCENE in $SCENE_LIST;

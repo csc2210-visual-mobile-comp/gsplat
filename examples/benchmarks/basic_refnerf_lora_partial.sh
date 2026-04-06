@@ -11,12 +11,7 @@ LORA_RANK=32
 
 # Define LoRA target combinations
 LORA_TARGET_SETS=(
-    "colors quats"
-    "colors scales"
-    "colors opacities"
-    "colors quats scales"
-    "quats scales"
-    "quats scales opacities"
+    "colors"
 )
 
 # Optional: fix extension once
@@ -48,7 +43,6 @@ for SCENE in $SCENE_LIST; do
             --save-steps 2000 \
             --disable-viewer \
             --data-factor "$DATA_FACTOR" \
-            --render-traj-path "$RENDER_TRAJ_PATH" \
             --data-dir "${SCENE_DIR}/${SCENE}/" \
             --result-dir "$SCENE_RESULT_DIR" \
             --lora-rank "$LORA_RANK" \

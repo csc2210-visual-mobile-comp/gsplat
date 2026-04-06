@@ -1629,7 +1629,7 @@ if __name__ == "__main__":
         "default": (
             "Partial-LoRA Gaussian splatting with LoRA-aware densification (LoRAStrategy).",
             Config(
-                strategy=LoRATargetStrategyAB(verbose=True),
+                strategy=LoRAStrategy(verbose=True),
             ),
         ),
         "mcmc": (
