@@ -1216,6 +1216,7 @@ class Runner:
                     step=step,
                     info=info,
                     packed=cfg.packed,
+                    get_eff_params_fn=self._get_effective_splat_params,
                 )
             elif isinstance(self.cfg.strategy, LoRATargetStrategyAB):
                 self.cfg.strategy.step_post_backward(

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import torch
 from typing_extensions import Literal
@@ -161,8 +161,16 @@ class LoRAStrategy(Strategy):
         step: int,
         info: Dict[str, Any],
         packed: bool = False,
+        get_eff_params_fn: Optional[Callable[[], Dict[str, torch.Tensor]]] = None,
     ):
-        """Callback function to be executed after the `loss.backward()` call."""
+        """Callback function to be executed after the `loss.backward()` call.
+
+        Args:
+            get_eff_params_fn: Optional callable that recomputes effective params
+                (base + A @ B) from the current splat state. When provided, it is
+                called after _grow_gs so that _prune_gs sees fresh effective params
+                for the newly added Gaussians rather than the stale pre-grow snapshot.
+        """
         if step >= self.refine_stop_iter:
             return
 
@@ -180,6 +188,11 @@ class LoRAStrategy(Strategy):
                     f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
                     f"Now having {len(params['means'])} GSs."
                 )
+
+            # Recompute eff_params so _prune_gs sees the correct shape and values
+            # for newly added Gaussians (their A rows are fresh copies of parents).
+            if get_eff_params_fn is not None:
+                eff_params = get_eff_params_fn()
 
             # prune GSs
             n_prune = self._prune_gs(eff_params, params, optimizers, state, step)
