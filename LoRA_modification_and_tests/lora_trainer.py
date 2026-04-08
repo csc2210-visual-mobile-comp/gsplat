@@ -110,7 +110,7 @@ class Config:
     lora_quota: Tuple[float, float, float] = (0.2, 0.6, 0.2)
     # Memory hypothesis probing: print per-step breakdown every mem_probe_every steps.
     # Set to 0 to disable.
-    mem_probe_every: int = 0
+    mem_probe_every: int = 100
     # Initial opacity of GS
     init_opa: float = 0.1
     # Initial scale of GS
@@ -1045,7 +1045,7 @@ class Runner:
         pbar = tqdm.tqdm(range(init_step, max_steps))
         for step in pbar:
             self._mem_probe_this_step = (
-                cfg.mem_probe_every > 0 and step % cfg.mem_probe_every == 0
+                cfg.mem_probe_every > 0 and (step + 1) % cfg.mem_probe_every == 0
             )
             if self._mem_probe_this_step:
                 torch.cuda.synchronize()
