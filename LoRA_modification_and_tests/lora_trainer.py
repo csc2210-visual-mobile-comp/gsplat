@@ -107,7 +107,7 @@ class Config:
     lora_rank: int = 16
     lora_max_rank: int = 32
     lora_min_rank: int = 2
-    lora_quota: Tuple[float, float, float] = (0.2, 0.6, 0.2)
+    lora_quota: Tuple[float, float] = (300, 600)
     # Initial opacity of GS
     init_opa: float = 0.1
     # Initial scale of GS
@@ -245,7 +245,7 @@ def create_splats_with_optimizers(
     shN_lr: float = 2.5e-3 / 20,
     scene_scale: float = 1.0,
     sh_degree: int = 3,
-    lora_rank: int = 16, # OUR CHANGE: Maximum LoRA rank for SH correction
+    lora_quota: tuple = [100, 100], # OUR CHANGE: Maximum LoRA rank for SH correction
     sparse_grad: bool = False,
     visible_adam: bool = False,
     batch_size: int = 1,
@@ -291,11 +291,18 @@ def create_splats_with_optimizers(
         colors[:, 0, :] = rgb_to_sh(rgbs)
         params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
         # OUR CHANGE: LoRA Modifier 1
-        # params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
-        lora_A = torch.randn((N, lora_rank)) * 0.01
-        params.append(("lora_A", torch.nn.Parameter(lora_A), shN_lr))
+        N_high = int(lora_quota[0] * 1000)
+        N_mid = int(lora_quota[1] * 1000)
+        N_mid_pool = N_high + N_mid
 
-        # OUR CHANGE: Rank Tracker Mask
+        lora_base = torch.randn((N, 2)) * 0.01
+        params.append(("lora_base", torch.nn.Parameter(lora_base), shN_lr))
+
+        mid_pointers = torch.full((N,), -1, dtype=torch.long)
+        high_pointers = torch.full((N,), -1, dtype=torch.long)
+        params.append(("mid_pointers", torch.nn.Parameter(mid_pointers, requires_grad=False), 0.0))
+        params.append(("high_pointers", torch.nn.Parameter(high_pointers, requires_grad=False), 0.0))
+        
         current_ranks = torch.full((N, 1), float(cfg.lora_min_rank))
         params.append(("current_ranks", torch.nn.Parameter(current_ranks, requires_grad=False), 0.0))
         lora_grad_accum = torch.zeros((N, 1))
@@ -417,7 +424,7 @@ class Runner:
             shN_lr=cfg.shN_lr,
             scene_scale=self.scene_scale,
             sh_degree=cfg.sh_degree,
-            lora_rank=cfg.lora_rank if cfg.disable_dynamic_rank else cfg.lora_max_rank, # OUR CHANGE: Maximum LoRA rank for SH correction
+            lora_quota=cfg.lora_quota, # OUR CHANGE: Maximum LoRA rank for SH correction
             sparse_grad=cfg.sparse_grad,
             visible_adam=cfg.visible_adam,
             batch_size=cfg.batch_size,
@@ -433,10 +440,14 @@ class Runner:
         rank = cfg.lora_rank if cfg.disable_dynamic_rank else cfg.lora_max_rank
         self.lora_B = torch.nn.Parameter(torch.randn(rank, 3 * shN_bands, device=self.device) * 0.01)
         
-        # We must give Matrix B its own optimizer so Adam updates it!
+        N_high = int(cfg.lora_quota[0] * 1000)
+        N_mid = int(cfg.lora_quota[1] * 1000)
+        self.lora_high_pool = torch.nn.Parameter(torch.randn((N_high, 24), device=self.device) * 0.01)
+        self.lora_mid_pool = torch.nn.Parameter(torch.randn((N_high + N_mid, 6), device=self.device) * 0.01)
+
         self.lora_optimizers = [
             torch.optim.Adam(
-                [self.lora_B], 
+                [self.lora_B, self.lora_high_pool, self.lora_mid_pool], 
                 lr=cfg.shN_lr * math.sqrt(cfg.batch_size * world_size), 
                 eps=1e-15
             )
@@ -623,27 +634,26 @@ class Runner:
                 lora_A = self.splats["lora_A"]
                 shN_computed = torch.matmul(lora_A, self.lora_B)
             else:
-                # 1. Define the discrete capacity buckets
-                buckets = [2, 8, 32] 
-                
-                # 2. Pre-allocate the dense output tensor
-                shN_computed = torch.zeros(
-                    (self.splats["lora_A"].shape[0], self.lora_B.shape[1]), 
-                    device=self.device
-                )
-                
-                ranks_sq = self.splats["current_ranks"].squeeze()
-                
-                # 3. Iterate through buckets and perform dense GEMMs on slices
-                for r in buckets:
-                    mask_r = (ranks_sq == r)
-                    if not mask_r.any():
-                        continue
-                    
-                    A_slice = self.splats["lora_A"][mask_r, :r]
-                    B_slice = self.lora_B[:r, :]
-                    
-                    shN_computed[mask_r] = A_slice @ B_slice
+                # with torch.autocast("cuda", dtype=torch.bfloat16):
+                dynamic_ranks = [self.splats["lora_base"]]
+            
+                mid_full = torch.zeros((dynamic_ranks[0].shape[0], 6), device=self.device, dtype=torch.float32)
+                valid_mid = self.splats["mid_pointers"] >= 0
+                if valid_mid.any():
+                    pool_indices = self.splats["mid_pointers"][valid_mid]
+                    mid_full[valid_mid] = self.lora_mid_pool[pool_indices]
+                dynamic_ranks.append(mid_full)
+
+                high_full = torch.zeros((dynamic_ranks[0].shape[0], 24), device=self.device, dtype=torch.float32)
+                valid_high = self.splats["high_pointers"] >= 0
+                if valid_high.any():
+                    pool_indices = self.splats["high_pointers"][valid_high]
+                    high_full[valid_high] = self.lora_high_pool[pool_indices]
+                dynamic_ranks.append(high_full)
+
+                gathered_params = torch.cat(dynamic_ranks, dim=1) # Only ~171 MB total
+                final_shN = gathered_params @ self.lora_B
+                shN_computed = final_shN.view(-1, shN_bands, 3)
 
             shN_computed = shN_computed.view(-1, shN_bands, 3) 
             colors = torch.cat([self.splats["sh0"], shN_computed], 1)  # [N, K, 3]
@@ -963,12 +973,39 @@ class Runner:
 
             loss.backward()
 
+            with torch.no_grad():
+                for name, param in self.splats.items():
+                    if param.grad is not None:
+                        torch.nan_to_num_(param.grad, nan=0.0, posinf=0.0, neginf=0.0)
+                
+                for pool in [self.lora_B, self.lora_mid_pool, self.lora_high_pool]:
+                    if pool.grad is not None:
+                        torch.nan_to_num_(pool.grad, nan=0.0, posinf=0.0, neginf=0.0)
+
             # OUR CHANGE: Quantized Dynamic LoRA Rank Adjustment
             if not cfg.disable_dynamic_rank:
                 with torch.no_grad():
-                    if self.splats["lora_A"].grad is not None:
-                        current_step_frustration = self.splats["lora_A"].grad.abs().sum(dim=-1, keepdim=True)
-                        self.splats["lora_grad_accum"].add_(current_step_frustration)
+                    N = self.splats["means"].shape[0]
+                    current_step_frustration = torch.zeros((N, 1), device=self.device)
+
+                    if self.splats["lora_base"].grad is not None:
+                        current_step_frustration += self.splats["lora_base"].grad.abs().sum(dim=-1, keepdim=True)
+
+                    if self.lora_mid_pool.grad is not None:
+                        valid_mid = self.splats["mid_pointers"] >= 0
+                        if valid_mid.any():
+                            pool_indices = self.splats["mid_pointers"][valid_mid]
+                            mid_grads = self.lora_mid_pool.grad[pool_indices].abs().sum(dim=-1, keepdim=True)
+                            current_step_frustration[valid_mid] += mid_grads
+
+                    if self.lora_high_pool.grad is not None:
+                        valid_high = self.splats["high_pointers"] >= 0
+                        if valid_high.any():
+                            pool_indices = self.splats["high_pointers"][valid_high]
+                            high_grads = self.lora_high_pool.grad[pool_indices].abs().sum(dim=-1, keepdim=True)
+                            current_step_frustration[valid_high] += high_grads
+
+                    self.splats["lora_grad_accum"].add_(current_step_frustration)
 
             if not cfg.disable_dynamic_rank:
                 allocation_interval = len(self.trainset)
@@ -979,38 +1016,93 @@ class Runner:
                 
                 if step > 0 and step % allocation_interval == 0 and step <= freeze_step:
                     with torch.no_grad():
-                        grad_frustration = self.splats["lora_grad_accum"] / (self.splats["current_ranks"].data + 1e-8)
+                        N_current = self.splats["means"].shape[0]
+                        N_high_capacity = self.lora_high_pool.shape[0]
+                        N_mid_capacity = self.lora_mid_pool.shape[0]
                         
-                        top_percentile = 1.0 - cfg.lora_quota[0]
-                        bottom_percentile = cfg.lora_quota[2]
-                        top_thresh = torch.quantile(grad_frustration, top_percentile)
-                        bottom_thresh = torch.quantile(grad_frustration, bottom_percentile)
+                        grad_frustration = (self.splats["lora_grad_accum"] / (self.splats["current_ranks"].data + 1e-8)).squeeze()
+
+                        k_high = min(N_current, N_high_capacity)
+                        _, target_high_indices = torch.topk(grad_frustration, k_high)
+
+                        old_high_mask = self.splats["high_pointers"] >= 0
+                        new_high_mask = torch.zeros_like(old_high_mask)
+                        new_high_mask[target_high_indices] = True
+
+                        evicted_high = old_high_mask & ~new_high_mask
+                        promoted_high = ~old_high_mask & new_high_mask
+                        survivors_high = old_high_mask & new_high_mask
+
+                        self.splats["high_pointers"][evicted_high] = -1
+
+                        kept_high_slots = self.splats["high_pointers"][survivors_high]
+                        pool_slot_mask = torch.ones(N_high_capacity, dtype=torch.bool, device=self.device)
+                        pool_slot_mask[kept_high_slots] = False 
+                        available_high_slots = torch.nonzero(pool_slot_mask).squeeze(-1)
+
+                        num_promoted = promoted_high.sum().item()
+                        slots_to_assign = available_high_slots[:num_promoted]
+                        self.splats["high_pointers"][promoted_high] = slots_to_assign
+
+                        if len(slots_to_assign) > 0:
+                            fresh_noise = torch.zeros((len(slots_to_assign), 24), device=self.device) 
+                            self.lora_high_pool.data[slots_to_assign] = fresh_noise
+
+                            opt_lora = self.lora_optimizers[0]
+                            pool_tensor = self.lora_high_pool
+                            if pool_tensor in opt_lora.state:
+                                state = opt_lora.state[pool_tensor]
+                                if "exp_avg" in state:
+                                    state["exp_avg"][slots_to_assign] = 0.0
+                                if "exp_avg_sq" in state:
+                                    state["exp_avg_sq"][slots_to_assign] = 0.0
+
+                        temp_frustration = grad_frustration.clone()
+                        temp_frustration[target_high_indices] = -1.0 
                         
-                        top_mask = grad_frustration >= top_thresh
-                        bottom_mask = grad_frustration <= bottom_thresh
-                        middle_mask = ~(top_mask | bottom_mask)
+                        k_mid_only = max(0, min(N_current - k_high, N_mid_capacity - k_high))
+                        _, target_mid_only_indices = torch.topk(temp_frustration, k_mid_only)
 
-                        r_data = self.splats["current_ranks"].data
-                        r_data[top_mask] = float(cfg.lora_max_rank)
-                        r_data[middle_mask] = 8.0
-                        r_data[bottom_mask] = float(cfg.lora_min_rank)
+                        target_mid_indices = torch.cat([target_high_indices, target_mid_only_indices])
 
-                        rank_idx = torch.arange(cfg.lora_max_rank, device=self.device).unsqueeze(0)
-                        active_mask = rank_idx < self.splats["current_ranks"]
-                        dead_mask = ~active_mask
+                        old_mid_mask = self.splats["mid_pointers"] >= 0
+                        new_mid_mask = torch.zeros_like(old_mid_mask)
+                        new_mid_mask[target_mid_indices] = True
 
-                        fresh_noise = torch.randn_like(self.splats["lora_A"]) * 0.01
-                        self.splats["lora_A"].data[dead_mask] = fresh_noise[dead_mask]
+                        evicted_mid = old_mid_mask & ~new_mid_mask
+                        promoted_mid = ~old_mid_mask & new_mid_mask
+                        survivors_mid = old_mid_mask & new_mid_mask
 
-                        opt = self.optimizers["lora_A"]
-                        if self.splats["lora_A"] in opt.state:
-                            state = opt.state[self.splats["lora_A"]]
-                            if "exp_avg" in state:
-                                state["exp_avg"][dead_mask] = 0.0
-                            if "exp_avg_sq" in state:
-                                state["exp_avg_sq"][dead_mask] = 0.0
+                        self.splats["mid_pointers"][evicted_mid] = -1
+
+                        kept_mid_slots = self.splats["mid_pointers"][survivors_mid]
+                        mid_pool_slot_mask = torch.ones(N_mid_capacity, dtype=torch.bool, device=self.device)
+                        mid_pool_slot_mask[kept_mid_slots] = False
+                        available_mid_slots = torch.nonzero(mid_pool_slot_mask).squeeze(-1)
+
+                        num_mid_promoted = promoted_mid.sum().item()
+                        mid_slots_to_assign = available_mid_slots[:num_mid_promoted]
+                        self.splats["mid_pointers"][promoted_mid] = mid_slots_to_assign
+
+                        if len(mid_slots_to_assign) > 0:
+                            mid_fresh_noise = torch.zeros((len(mid_slots_to_assign), 6), device=self.device)
+                            self.lora_mid_pool.data[mid_slots_to_assign] = mid_fresh_noise
+
+                            opt_lora = self.lora_optimizers[0] 
+                            mid_pool_tensor = self.lora_mid_pool 
+                            if mid_pool_tensor in opt_lora.state:
+                                state = opt_lora.state[mid_pool_tensor]
+                                if "exp_avg" in state:
+                                    state["exp_avg"][mid_slots_to_assign] = 0.0
+                                if "exp_avg_sq" in state:
+                                    state["exp_avg_sq"][mid_slots_to_assign] = 0.0
+
+                        self.splats["current_ranks"].fill_(float(cfg.lora_min_rank))
+                        mid_rank_val = float(int((cfg.lora_min_rank * cfg.lora_max_rank) ** 0.5))
+                        self.splats["current_ranks"][self.splats["mid_pointers"] >= 0] = mid_rank_val
+                        self.splats["current_ranks"][self.splats["high_pointers"] >= 0] = float(cfg.lora_max_rank)
                         
-                        self.splats["lora_grad_accum"].zero_()
+                        self.splats["lora_grad_accum"].mul_(0.5)
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
@@ -1050,9 +1142,8 @@ class Runner:
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
                     self.writer.add_image("train/render", canvas, step)
                 # OUR CHANGE: Log LoRA-specific metrics to TensorBoard
-                if self.splats["lora_A"].grad is not None:
-                    grad_sum = self.splats["lora_A"].grad.abs().sum(dim=-1)
-                    grad_frustration = grad_sum / (self.splats["current_ranks"].data.squeeze() + 1e-8)
+                if self.splats["lora_base"].grad is not None:
+                    grad_frustration = current_step_frustration.squeeze() / (self.splats["current_ranks"].data.squeeze() + 1e-8)
                     
                     avg_grad = grad_frustration.mean().item()
                     avg_rank = self.splats["current_ranks"].float().mean().item()
@@ -1122,15 +1213,22 @@ class Runner:
                     # OUR CHANGE: Use the LoRA-corrected SH coefficients for export
                     # shN = self.splats["shN"]
                     shN_bands = (self.cfg.sh_degree + 1) ** 2 - 1
-                    if self.cfg.disable_dynamic_rank:
-                        lora_A = self.splats["lora_A"]
-                    else:
-                        rank_idx = torch.arange(self.cfg.lora_max_rank, device=self.device)
-                        rank_mask = (rank_idx < self.splats["current_ranks"]).float()
-                        lora_A = self.splats["lora_A"] * rank_mask
+                    
+                    final_shN = self.splats["lora_base"] @ self.lora_B[:2, :]
 
-                    shN_computed = torch.matmul(lora_A, self.lora_B)
-                    shN = shN_computed.view(-1, shN_bands, 3) 
+                    valid_mid = self.splats["mid_pointers"] >= 0
+                    if valid_mid.any():
+                        pool_indices = self.splats["mid_pointers"][valid_mid]
+                        color_mid = self.lora_mid_pool[pool_indices] @ self.lora_B[2:8, :]
+                        final_shN[valid_mid] += color_mid
+
+                    valid_high = self.splats["high_pointers"] >= 0
+                    if valid_high.any():
+                        pool_indices = self.splats["high_pointers"][valid_high]
+                        color_high = self.lora_high_pool[pool_indices] @ self.lora_B[8:32, :]
+                        final_shN[valid_high] += color_high
+
+                    shN = final_shN.view(-1, shN_bands, 3)
 
                 means = self.splats["means"]
                 scales = self.splats["scales"]
@@ -1173,8 +1271,9 @@ class Runner:
                     visibility_mask = (info["radii"] > 0).all(-1).any(0)
 
             # OUR CHANGE: GRADIENT CLIPPING
-            if self.splats["lora_A"].grad is not None and self.lora_B.grad is not None:
-                torch.nn.utils.clip_grad_norm_([self.splats["lora_A"], self.lora_B], max_norm=1.0)
+            params_to_clip = [self.lora_B, self.lora_mid_pool, self.lora_high_pool, self.splats["lora_base"]]
+            if len(params_to_clip) > 1: # Ensure at least one pool has gradients
+                torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=1.0)
 
             # optimize
             for optimizer in self.optimizers.values():
@@ -1222,7 +1321,7 @@ class Runner:
                 )
             else:
                 assert_never(self.cfg.strategy)
-
+                          
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
