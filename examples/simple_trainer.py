@@ -32,6 +32,7 @@ from typing_extensions import Literal, assert_never
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
 
 from gsplat import export_splats
+from rank_analysis_utils import RankScoring, RankClustering, CheckpointData
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
@@ -240,6 +241,11 @@ class Config:
     lora_warmup_cycles: int = 5
     # Save a rank heatmap image every N training steps (0 = disable)
     lora_heatmap_interval: int = 1000
+
+    # OUR CHANGE: Steps at which to snapshot all rank scores + heatmaps for analysis.
+    # Works for all lora_modes (including "none"). Saves to <result_dir>/rank_analysis/.
+    # Typical: [1100, 2100, 3100] for lora runs; [1100, 2100, 3100, 6000, 15000] for sh3.
+    rank_analysis_steps: List[int] = field(default_factory=list)
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -812,21 +818,35 @@ class Runner:
 
         return render_colors, render_alphas, info
 
-    # OUR CHANGE: Heatmap helper — renders each Gaussian colored by its LoRA rank bucket
+    # OUR CHANGE: Heatmap helper — renders each Gaussian colored by its rank bucket.
+    # Works for all lora_modes: pass bucket_idx explicitly for non-LoRA or analysis use;
+    # omit it (None) to fall back to current_ranks (LoRA training heatmaps).
     @torch.no_grad()
-    def render_rank_heatmap(self, camtoworlds: Tensor, Ks: Tensor, width: int, height: int) -> Tensor:
-        """Renders a heatmap coloring each Gaussian by its LoRA rank bucket.
+    def render_rank_heatmap(
+        self,
+        camtoworlds: Tensor,
+        Ks: Tensor,
+        width: int,
+        height: int,
+        bucket_idx: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Renders a heatmap coloring each Gaussian by its rank bucket.
         Colors: bottom bucket -> blue (0,0,1), middle -> green (0,1,0), top -> red (1,0,0)
+
+        Args:
+            bucket_idx: [N] int tensor with values 0/1/2. If None, derived from
+                        self.splats["current_ranks"] (existing LoRA training behaviour).
         """
         means = self.splats["means"]
         quats = self.splats["quats"]
         scales = torch.exp(self.splats["scales"])
         opacities = torch.sigmoid(self.splats["opacities"])
 
-        ranks = self.splats["current_ranks"].squeeze().float()  # [N]
-        buckets = torch.tensor(self.cfg.lora_rank_buckets, device=self.device, dtype=torch.float)
-        # bucket_idx: 0=bottom, 1=middle, 2=top
-        bucket_idx = (ranks.unsqueeze(1) == buckets.unsqueeze(0)).float().argmax(dim=1)
+        if bucket_idx is None:
+            # Default: derive from current_ranks (LoRA training heatmaps)
+            ranks = self.splats["current_ranks"].squeeze().float()  # [N]
+            buckets = torch.tensor(self.cfg.lora_rank_buckets, device=self.device, dtype=torch.float)
+            bucket_idx = (ranks.unsqueeze(1) == buckets.unsqueeze(0)).float().argmax(dim=1)
         palette = torch.tensor([[0., 0., 1.], [0., 1., 0.], [1., 0., 0.]], device=self.device)
         heatmap_rgb = palette[bucket_idx]  # [N, 3]
 
@@ -1086,6 +1106,10 @@ class Runner:
                         if score is not None:
                             self._apply_lora_rank_buckets(score)
                             self.splats["lora_grad_accum"].zero_()
+
+            # OUR CHANGE: Rank analysis snapshot at configured steps (all lora_modes)
+            if step in cfg.rank_analysis_steps:
+                self._save_rank_analysis_checkpoint(step, camtoworlds, Ks, width, height)
 
             # OUR CHANGE: Periodic rank heatmap during training (only for LoRA modes)
             if (world_rank == 0 and cfg.lora_mode != "none" and cfg.lora_heatmap_interval > 0
@@ -1604,6 +1628,234 @@ class Runner:
         for k in splats_c.keys():
             self.splats[k].data = splats_c[k].to(self.device)
         self.eval(step=step, stage="compress")
+
+    @torch.no_grad()
+    def _compute_gaussian_color_variance(self) -> Optional[Tensor]:
+        """Project each Gaussian center into all training images and compute
+        per-Gaussian color variance across views.
+
+        Returns [N, 1] tensor of mean RGB variance (in [0, 255²] units), or None
+        if fewer than 3 images are available.  Computed on CPU to avoid OOM.
+        """
+        import cv2 as _cv2
+
+        parser = self.parser
+        means_np = self.splats["means"].detach().cpu().numpy()  # [N, 3]
+        N = means_np.shape[0]
+
+        # Accumulate per-Gaussian color observations across training images
+        obs_sum  = np.zeros((N, 3), dtype=np.float64)   # sum of RGB
+        obs_sq   = np.zeros((N, 3), dtype=np.float64)   # sum of RGB²
+        obs_cnt  = np.zeros(N, dtype=np.int32)
+
+        train_indices = np.arange(len(parser.image_names))
+        train_indices = train_indices[train_indices % parser.test_every != 0]
+
+        for parser_idx in train_indices:
+            camera_id   = parser.camera_ids[parser_idx]
+            K           = parser.Ks_dict[camera_id]           # (3,3)
+            c2w         = parser.camtoworlds[parser_idx]       # (4,4)
+            w2c         = np.linalg.inv(c2w)
+            R, t        = w2c[:3, :3], w2c[:3, 3]
+
+            # Project Gaussian centers
+            pts_cam = (R @ means_np.T + t[:, None]).T  # [N, 3]
+            in_front = pts_cam[:, 2] > 0
+            proj = (K @ pts_cam.T).T                   # [N, 3]
+            uv = proj[:, :2] / np.maximum(proj[:, 2:3], 1e-8)  # [N, 2]
+
+            # Load and undistort image (reuse sfm_color_variance logic)
+            image = imageio.imread(parser.image_paths[parser_idx])[..., :3].astype(np.float32)
+            if len(parser.params_dict.get(camera_id, [])) > 0 and camera_id in parser.mapx_dict:
+                image = _cv2.remap(image, parser.mapx_dict[camera_id],
+                                   parser.mapy_dict[camera_id], _cv2.INTER_LINEAR)
+                x0, y0, w, h = parser.roi_undist_dict[camera_id]
+                image = image[y0:y0 + h, x0:x0 + w]
+
+            H, W = image.shape[:2]
+            xi = np.round(uv[:, 0]).astype(np.int32)
+            yi = np.round(uv[:, 1]).astype(np.int32)
+            in_bounds = (xi >= 0) & (xi < W) & (yi >= 0) & (yi < H)
+            valid = in_front & in_bounds
+
+            xi_v, yi_v = xi[valid], yi[valid]
+            rgb = image[yi_v, xi_v]  # [M, 3]
+
+            idx = np.where(valid)[0]
+            obs_sum[idx]  += rgb
+            obs_sq[idx]   += rgb ** 2
+            obs_cnt[idx]  += 1
+
+        # Variance = E[x²] - E[x]² for each channel; then mean over RGB
+        enough = obs_cnt >= 3
+        variance = np.zeros(N, dtype=np.float32)
+        cnt = obs_cnt[enough].reshape(-1, 1).astype(np.float64)
+        mean_sq  = obs_sq[enough]  / cnt
+        sq_mean  = (obs_sum[enough] / cnt) ** 2
+        variance[enough] = (mean_sq - sq_mean).mean(axis=1).astype(np.float32)
+
+        return torch.from_numpy(variance).unsqueeze(-1).to(self.device)
+
+    @torch.no_grad()
+    def _collect_rank_scores(self) -> Dict[str, Tensor]:
+        """Collect all available per-Gaussian scores [N, 1] for the current run type.
+
+        No-LoRA run:  sh_energy, color_variance
+        LoRA run:     sh_energy, gradient, opacity_grad, color_variance
+        gradient/opacity_grad are skipped when lora_grad_accum is all-zero
+        (e.g. at the very first analysis step before any backward pass).
+        """
+        cfg = self.cfg
+        scores: Dict[str, Tensor] = {}
+
+        # sh_energy
+        if cfg.lora_mode != "none":
+            scores["sh_energy"] = RankScoring.sh_energy_lora(
+                self.splats["lora_A"],
+                self.lora_B,
+                self.splats["current_ranks"].data,
+                cfg.lora_rank_buckets,
+            )
+        elif "shN" in self.splats:
+            shN = self.splats["shN"]  # [N, K, 3] → flatten to [N, K*3] for energy
+            scores["sh_energy"] = RankScoring.sh_energy_direct(shN.reshape(shN.shape[0], -1))
+
+        # gradient-based (LoRA only, skip if accumulator empty)
+        if cfg.lora_mode != "none":
+            grad_sum = self.splats["lora_grad_accum"]
+            if grad_sum.sum() > 0:
+                scores["gradient"] = RankScoring.gradient_score(
+                    grad_sum, self.splats["current_ranks"].data
+                )
+                scores["opacity_grad"] = RankScoring.opacity_grad_score(
+                    grad_sum, self.splats["current_ranks"].data, self.splats["opacities"]
+                )
+
+        # color_variance — project Gaussian centers into training images
+        cv = self._compute_gaussian_color_variance()
+        if cv is not None:
+            scores["color_variance"] = cv
+
+        return scores
+
+    @torch.no_grad()
+    def _save_rank_analysis_checkpoint(
+        self,
+        step: int,
+        camtoworlds: Tensor,
+        Ks: Tensor,
+        width: int,
+        height: int,
+    ) -> None:
+        """Snapshot all rank scores + cluster assignments + heatmaps at this step.
+
+        Saves:
+          <result_dir>/rank_analysis/step_XXXXXX.npz  — scores + assignments
+          <result_dir>/renders/rank_analysis/          — one PNG per score × cluster method
+        """
+        from pathlib import Path as _Path
+
+        cfg = self.cfg
+        rank_buckets = cfg.lora_rank_buckets
+        buckets_t = torch.tensor(rank_buckets, device=self.device, dtype=torch.float)
+
+        analysis_dir = _Path(self.cfg.result_dir) / "rank_analysis"
+        heatmap_dir  = _Path(self.cfg.result_dir) / "renders" / "rank_analysis"
+        heatmap_dir.mkdir(parents=True, exist_ok=True)
+
+        scores = self._collect_rank_scores()
+        if not scores:
+            print(f"[rank analysis] step {step}: no scores available, skipping.")
+            return
+
+        scores_np   : Dict[str, np.ndarray] = {}
+        assignments : Dict[str, Dict[str, np.ndarray]] = {"kmeans": {}, "gmm": {}}
+        thresholds  : Dict[str, Dict[str, Tuple[float, float]]] = {"kmeans": {}, "gmm": {}}
+
+        for score_name, score in scores.items():
+            scores_np[score_name] = score.squeeze().cpu().numpy()
+
+            for cluster_method in ("kmeans", "gmm"):
+                ranks, top_t, bot_t = RankClustering.assign_buckets(
+                    score, rank_buckets, method=cluster_method,
+                    n_iter=cfg.lora_kmeans_iters,
+                )
+                assignments[cluster_method][score_name] = ranks.cpu().numpy()
+                thresholds[cluster_method][score_name]  = (float(top_t), float(bot_t))
+
+                # Render heatmap coloured by this score's clustering
+                b_idx = (ranks.unsqueeze(1) == buckets_t.unsqueeze(0)).float().argmax(dim=1)
+                heatmap = self.render_rank_heatmap(
+                    camtoworlds[:1], Ks[:1], width, height, bucket_idx=b_idx
+                )
+                heatmap_np = (heatmap.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+                imageio.imwrite(
+                    str(heatmap_dir / f"step{step:06d}_{score_name}_{cluster_method}.png"),
+                    heatmap_np,
+                )
+
+        ckpt = CheckpointData(
+            step=step,
+            num_gaussians=len(self.splats["means"]),
+            scores=scores_np,
+            assignments=assignments,
+            thresholds=thresholds,
+        )
+        ckpt.save(analysis_dir)
+
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as _plt
+
+        # Score histograms — linear + log scale side by side, one column per score
+        n_scores = len(scores_np)
+        fig, axes = _plt.subplots(2, n_scores, figsize=(5 * n_scores, 8), squeeze=False)
+        for col, (score_name, sv) in enumerate(scores_np.items()):
+            km_thresh = thresholds.get("kmeans", {}).get(score_name)
+            for row, (scale, xvals) in enumerate([("linear", sv), ("log", np.log1p(sv))]):
+                ax = axes[row][col]
+                ax.hist(xvals, bins=60, color="steelblue", edgecolor="none", alpha=0.8)
+                if km_thresh is not None:
+                    top_t, bot_t = km_thresh
+                    t_draw = (top_t, bot_t) if scale == "linear" else (np.log1p(top_t), np.log1p(bot_t))
+                    ax.axvline(t_draw[0], color="red",  linestyle="--", linewidth=1.2, label="kmeans high")
+                    ax.axvline(t_draw[1], color="blue", linestyle="--", linewidth=1.2, label="kmeans low")
+                ax.set_title(f"{score_name} ({scale})")
+                ax.set_xlabel("score" if scale == "linear" else "log(1 + score)")
+                ax.set_ylabel("# Gaussians")
+                ax.legend(fontsize=7)
+        fig.suptitle(f"Score histograms — step {step} ({len(self.splats['means'])} Gaussians)")
+        _plt.tight_layout()
+        _plt.savefig(str(heatmap_dir / f"step{step:06d}_score_histograms.png"), dpi=150)
+        _plt.close(fig)
+
+        # Bucket percentage bars — one subplot per (cluster_method × score_method)
+        combos = [(cm, sm) for cm in ("kmeans", "gmm") for sm in scores_np
+                  if sm in assignments.get(cm, {})]
+        if combos:
+            fig, axes = _plt.subplots(1, len(combos), figsize=(4 * len(combos), 4), squeeze=False)
+            bucket_labels = [f"rank {r}" for r in rank_buckets]
+            bar_colors = ["#4878d0", "#6acc65", "#d65f5f"]
+            for ax, (cm, sm) in zip(axes[0], combos):
+                assign = assignments[cm][sm]
+                total = len(assign)
+                pcts = [100.0 * np.sum(assign == r) / total for r in rank_buckets]
+                bars = ax.bar(bucket_labels, pcts, color=bar_colors)
+                for bar, pct in zip(bars, pcts):
+                    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                            f"{pct:.1f}%", ha="center", va="bottom", fontsize=8)
+                ax.set_title(f"{cm} + {sm}")
+                ax.set_ylabel("% of Gaussians")
+                ax.set_ylim(0, 105)
+            fig.suptitle(f"Bucket percentages — step {step}")
+            _plt.tight_layout()
+            _plt.savefig(str(heatmap_dir / f"step{step:06d}_bucket_pct.png"), dpi=150)
+            _plt.close(fig)
+
+        print(
+            f"[rank analysis] step {step}: {len(scores)} scores, "
+            f"{len(self.splats['means'])} Gaussians → {analysis_dir}"
+        )
 
     def _compute_lora_rank_score(self) -> Optional[Tensor]:
         """Return a per-Gaussian score [N, 1] used to assign LoRA rank buckets.
