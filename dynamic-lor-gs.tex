@@ -1,0 +1,188 @@
+%% Dynamic LoR-GS Project Report
+%% CSC 2210 - Visual and Mobile Computing, University of Toronto
+%%
+\documentclass[sigconf]{acmart}
+
+\AtBeginDocument{%
+  \providecommand\BibTeX{{Bib\TeX}}}
+
+\setcopyright{none}
+\acmConference[CSC 2210]{Visual and Mobile Computing}{2025}{University of Toronto}
+\settopmatter{printacmref=false}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+\pagestyle{plain}
+
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{microtype}
+\usepackage{xcolor}
+
+
+\newcommand{\TODO}[1]{\textcolor{red}{\textbf{[#1]}}}
+
+%% -------------------------------------------------------
+\begin{document}
+
+\title{Dynamic LoR-GS: Adaptive Low-Rank Gaussian Parameters\\
+       for Memory-Efficient 3D Gaussian Splatting Training}
+
+\author{\TODO{Author One}}
+\affiliation{\institution{University of Toronto}}
+\email{author1@mail.utoronto.ca}
+
+\author{\TODO{Author Two}}
+\affiliation{\institution{University of Toronto}}
+\email{author2@mail.utoronto.ca}
+
+\author{\TODO{Author Three}}
+\affiliation{\institution{University of Toronto}}
+\email{author3@mail.utoronto.ca}
+
+\begin{abstract}
+\TODO{Fill in last}
+\end{abstract}
+
+
+\maketitle
+
+%% -------------------------------------------------------
+\section{Background and Related Work}
+\label{sec:background}
+
+3D Gaussian Splatting (3DGS)~\cite{kerbl2023} has rapidly become the dominant
+paradigm for novel view synthesis, offering high visual quality with a real-time rendering 
+and fast training. By representing scenes as collections of explicit, differentiable 
+3D Gaussian primitives rendered via fast tile-based rasterization, 
+3DGS achieves high visual fidelity with training times measured in minutes. 
+This has sparked a large body of follow-on work spanning
+dynamic scenes~\cite{lr4dgstream}, scene editing~\cite{gaussianeditor}, compression~\cite{Papantonakis_2024, survey3dgs}, 
+and avatar generation~\cite{avatar}.
+
+Despite this success, training 3DGS on memory-constrained hardware remains
+difficult~\cite{kerbl2023, Papantonakis_2024, survey3dgs}. Peak GPU memory during 
+training is driven by two coupled factors.
+First, 3DGS employs an adaptive densification strategy that continuously clones
+and splits Gaussian primitives throughout optimization, growing the primitive count
+$N$ from an initial sparse point cloud to several million --- each new Gaussian
+adding to every active parameter tensor. Second, each Gaussian carries a substantial
+per-primitive parameter budget. Beyond position, opacity, and covariance, the
+view-dependent color of each primitive is encoded by spherical harmonic (SH)
+coefficients. Using degree-3 SH, each Gaussian stores $(3+1)^2 = 16$ coefficients
+per RGB channel, totaling 48 floating-point values per Gaussian. As noted in prior
+memory analyses~\cite{Papantonakis_2024, survey3dgs}, these SH coefficients alone account
+for more than half of all model parameters --- for a scene with $N = 3$ million
+Gaussians, this amounts to roughly 576\,MB before optimizer states and gradients
+are accounted for. The combination of a growing $N$ and a large per-Gaussian
+footprint makes peak training VRAM a hard constraint that existing methods have
+largely failed to address.
+
+A natural response is to reduce $N$ directly. Pruning-based methods such as
+Mini-Splatting~\cite{minisplatting} and LP-3DGS~\cite{lp3dgs} remove redundant
+Gaussians to produce more compact representations. However, aggressive pruning often
+trades reconstruction quality for memory, since each Gaussian encodes fine
+geometric and appearance detail that cannot always be recovered once removed.
+We take a different position: rather than reducing the number of primitives,
+we ask whether the \emph{per-Gaussian parameter cost} can be reduced adaptively
+--- allocating more capacity to primitives that genuinely require it and less
+to those that do not --- without compromising the Gaussian count or the
+reconstruction quality it affords.
+
+This question has been explored in prior work, but only after training completes.
+Reduced3DGS~\cite{Papantonakis_2024} introduces an adaptive per-Gaussian SH band
+selection based on view-dependent transmittance variance, substantially reducing
+storage and rendering memory. Critically, the authors acknowledge that this
+approach does not reduce \emph{peak training memory}, since the full SH tensor
+must be maintained throughout optimization before any pruning can occur.
+LFGS~\cite{lfgs} similarly applies dynamic SH masking post-training for
+compression. SG-Splatting~\cite{sgsplatting} and MEGS2~\cite{megs2} replace
+SH with spherical Gaussian lobes for more compact rendering, but again leave
+the training regime unchanged. The gap is clear: no existing method reduces
+per-Gaussian parameter cost \emph{during} training, where peak VRAM is
+actually determined.
+
+Our approach is to apply Low-Rank Adaptation (LoRA)~\cite{lora} directly to
+the learnable parameters of each Gaussian primitive during training. LoRA,
+originally proposed for parameter-efficient fine-tuning of large language models,
+replaces a parameter matrix $W \in \mathbb{R}^{m \times n}$ with a low-rank
+factorization $W \approx AB$, where $A \in \mathbb{R}^{m \times r}$,
+$B \in \mathbb{R}^{r \times n}$, and $r \ll \min(m, n)$, reducing parameter
+count from $mn$ to $r(m + n)$. By maintaining only the low-rank factors
+throughout training, the full parameter matrix is never allocated, directly
+reducing peak VRAM rather than compressing after the fact.
+
+Among the Gaussian attributes, the SH coefficient tensor is the natural primary
+candidate for low-rank factorization. Its structure as a matrix
+$C \in \mathbb{R}^{3 \times 16}$ (RGB channels $\times$ SH basis functions)
+makes the decomposition well-defined, and its dominance in the per-Gaussian
+memory budget makes it the highest-leverage target. The observation that
+Reduced3DGS~\cite{Papantonakis_2024} can prune high-degree SH bands from a large
+fraction of Gaussians with minimal quality loss supports our hypothesis that
+the effective rank of $C$ is low for most primitives. Furthermore, 
+rather than applying a fixed rank across all primitives, we draw inspiration from adaptive 
+budget allocation in language models~\cite{adalora} to dynamically distribute rank. 
+A flat matte surface requires far less representational capacity than a complex specular 
+reflection; our method dynamically models this heterogeneity.
+We also explore LoRA applied to other Gaussian attributes to characterize where low-rank structure
+is and is not beneficial; these experiments and their outcomes are reported in
+Section~\ref{sec:method}.
+
+LoRA has seen use in the 3DGS ecosystem, but not for this purpose.
+LR-4DGStream~\cite{lr4dgstream} applies low-rank adaptation to a deformation
+model for dynamic scene streaming bandwidth reduction. UFV-Splatter~\cite{ufvsplatter}
+injects LoRA into a feed-forward Gaussian-prediction network to handle unfavorable
+camera poses. In both cases, LoRA is applied to auxiliary neural network weights,
+not to Gaussian primitive parameters directly. StyleSplat~\cite{stylesplat} comes
+closest in spirit, directly optimizing the SH coefficients of selected Gaussians
+via a feature-matching loss to transfer artistic style --- but without any
+low-rank constraint or memory reduction goal. To our knowledge, no prior work
+applies low-rank factorization to the parameters of Gaussian primitives during
+training as a mechanism for reducing peak GPU memory.
+
+%% -------------------------------------------------------
+\section{Goal}
+\label{sec:goal}
+
+he primary goal of this project is to drastically reduce peak GPU training memory 
+in 3DGS, enabling high-fidelity scene optimization on memory-constrained, consumer-grade 
+hardware. We achieve this by replacing full-rank Gaussian parameters with per-Gaussian 
+low-rank factorizations. By dynamically allocating rank across primitives based on 
+their estimated view-dependent complexity, we aim to eliminate standard memory 
+bottlenecks without reducing the overall Gaussian count or sacrificing rendering quality.
+
+%% -------------------------------------------------------
+\section{Methodology}
+\label{sec:method}
+
+\TODO{Fill in}
+
+%% -------------------------------------------------------
+\section{Observations and Motivation}
+\label{sec:observations}
+
+\TODO{Fill in}
+
+%% -------------------------------------------------------
+\section{Ideas and Solutions}
+\label{sec:solutions}
+
+\TODO{Fill in}
+
+%% -------------------------------------------------------
+\section{Results}
+\label{sec:results}
+
+\TODO{Fill in}
+
+%% -------------------------------------------------------
+\section{Takeaways}
+\label{sec:takeaways}
+
+\TODO{Fill in}
+
+%% -------------------------------------------------------
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{references}
+
+\end{document}

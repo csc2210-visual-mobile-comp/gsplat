@@ -1,0 +1,175 @@
+%% references.bib
+%% Dynamic LoR-GS -- CSC 2210, University of Toronto
+%%
+%% Verify DOIs and page numbers before final submission.
+%% arXiv IDs are provided where ACM/proceedings details are unavailable.
+
+%% -------------------------------------------------------
+%% Foundational
+
+@misc{kerbl2023,
+      title={3D Gaussian Splatting for Real-Time Radiance Field Rendering}, 
+      author={Bernhard Kerbl and Georgios Kopanas and Thomas Leimkühler and George Drettakis},
+      year={2023},
+      eprint={2308.04079},
+      archivePrefix={arXiv},
+      primaryClass={cs.GR},
+      url={https://arxiv.org/abs/2308.04079}, 
+}
+
+@misc{lora,
+  author    = {Edward J. Hu and Yelong Shen and Phillip Wallis and Zeyuan Allen-Zhu and
+               Yuanzhi Li and Shean Wang and Lu Wang and Weizhu Chen},
+  title     = {{LoRA}: Low-Rank Adaptation of Large Language Models},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2022},
+  url       = {https://arxiv.org/abs/2106.09685}
+}
+
+
+%% GS usage examples
+
+@misc{gaussianeditor,
+      title={GaussianEditor: Swift and Controllable 3D Editing with Gaussian Splatting}, 
+      author={Yiwen Chen and Zilong Chen and Chi Zhang and Feng Wang and Xiaofeng Yang and Yikai Wang and Zhongang Cai and Lei Yang and Huaping Liu and Guosheng Lin},
+      year={2023},
+      eprint={2311.14521},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2311.14521}, 
+}
+
+@misc{avatar,
+      title={GaussianAvatars: Photorealistic Head Avatars with Rigged 3D Gaussians}, 
+      author={Shenhan Qian and Tobias Kirschstein and Liam Schoneveld and Davide Davoli and Simon Giebenhain and Matthias Nießner},
+      year={2024},
+      eprint={2312.02069},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2312.02069}, 
+}
+
+%% -------------------------------------------------------
+%% SH memory reduction / 3DGS compression
+
+@article{Papantonakis_2024,
+   title={Reducing the Memory Footprint of 3D Gaussian Splatting},
+   volume={7},
+   ISSN={2577-6193},
+   url={http://dx.doi.org/10.1145/3651282},
+   DOI={10.1145/3651282},
+   number={1},
+   journal={Proceedings of the ACM on Computer Graphics and Interactive Techniques},
+   publisher={Association for Computing Machinery (ACM)},
+   author={Papantonakis, Panagiotis and Kopanas, Georgios and Kerbl, Bernhard and Lanvin, Alexandre and Drettakis, George},
+   year={2024},
+   month=may, pages={1–17} }
+
+@article{survey3dgs,
+    author = {Bagdasarian, M. T. and Knoll, P. and Li, Y. and Barthel, F. and Hilsmann, A. and Eisert, P. and Morgenstern, W.},
+    title = {3DGS.zip: A survey on 3D Gaussian Splatting Compression Methods},
+    journal = {Computer Graphics Forum},
+    volume = {44},
+    number = {2},
+    pages = {e70078},
+    year = {2025},
+    doi = {https://doi.org/10.1111/cgf.70078},
+    url = {https://onlinelibrary.wiley.com/doi/abs/10.1111/cgf.70078},
+}
+
+
+@misc{sgsplatting,
+      title={SG-Splatting: Accelerating 3D Gaussian Splatting with Spherical Gaussians}, 
+      author={Yiwen Wang and Siyuan Chen and Ran Yi},
+      year={2024},
+      eprint={2501.00342},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2501.00342}, 
+}
+
+@misc{megs2,
+      title={MEGS$^{2}$: Memory-Efficient Gaussian Splatting via Spherical Gaussians and Unified Pruning}, 
+      author={Jiarui Chen and Yikeng Chen and Yingshuang Zou and Ye Huang and Peng Wang and Yuan Liu and Yujing Sun and Wenping Wang},
+      year={2026},
+      eprint={2509.07021},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2509.07021}, 
+}
+
+@article{lfgs,
+    title = {LFGS: A lightweight framework for efficient 3D Gaussian Splatting with minimal memory footprint},
+    journal = {Computers & Graphics},
+    volume = {131},
+    pages = {104309},
+    year = {2025},
+    issn = {0097-8493},
+    doi = {https://doi.org/10.1016/j.cag.2025.104309},
+    url = {https://www.sciencedirect.com/science/article/pii/S0097849325001505},
+    author = {Ruiqi Wu and Linlin Jiao and Gang Liu and Li Zhu and Xuan Fei and Yashuang Mu and Chao Fan},
+}
+
+%% -------------------------------------------------------
+%% Gaussian pruning / primitive reduction
+
+@inproceedings{minisplatting,
+  author    = {Guangchi Fang and Bing Wang},
+  title     = {Mini-Splatting: Representing the Scene with a Limited Number of Gaussians},
+  booktitle = {European Conference on Computer Vision (ECCV)},
+  year      = {2024},
+  url       = {https://arxiv.org/abs/2403.14166}
+}
+
+@misc{lp3dgs,
+      title={Mini-Splatting: Representing Scenes with a Constrained Number of Gaussians}, 
+      author={Guangchi Fang and Bing Wang},
+      year={2024},
+      eprint={2403.14166},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2403.14166}, 
+}
+
+%% -------------------------------------------------------
+%% LoRA in 3DGS ecosystem
+
+@misc{lr4dgstream,
+      title={Efficient 4D Gaussian Stream with Low Rank Adaptation}, 
+      author={Zhenhuan Liu and Shuai Liu and Yidong Lu and Yirui Chen and Jie Yang and Wei Liu},
+      year={2025},
+      eprint={2502.16575},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2502.16575}, 
+}
+
+@misc{ufvsplatter,
+      title={UFV-Splatter: Pose-Free Feed-Forward 3D Gaussian Splatting Adapted to Unfavorable Views}, 
+      author={Yuki Fujimura and Takahiro Kushida and Kazuya Kitano and Takuya Funatomi and Yasuhiro Mukaigawa},
+      year={2025},
+      eprint={2507.22342},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2507.22342}, 
+}
+
+@misc{stylesplat,
+      title={StyleSplat: 3D Object Style Transfer with Gaussian Splatting}, 
+      author={Sahil Jain and Avik Kuthiala and Prabhdeep Singh Sethi and Prakanshul Saxena},
+      year={2024},
+      eprint={2407.09473},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2407.09473}, 
+}
+
+@misc{adalora,
+      title={AdaLoRA: Adaptive Budget Allocation for Parameter-Efficient Fine-Tuning}, 
+      author={Qingru Zhang and Minshuo Chen and Alexander Bukharin and Nikos Karampatziakis and Pengcheng He and Yu Cheng and Weizhu Chen and Tuo Zhao},
+      year={2023},
+      eprint={2303.10512},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2303.10512}, 
+}
