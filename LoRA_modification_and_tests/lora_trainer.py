@@ -670,13 +670,22 @@ class Runner:
                         print(f"  [H2] bucket r={r} (N={len(idxs)}): matmul alloc {(_after_matmul - _before_matmul)/1e6:.1f} MB")
                     shN_computed[idxs] = result
 
-            shN_computed = shN_computed.view(-1, shN_bands, 3) 
+            shN_computed = shN_computed.view(-1, shN_bands, 3)
+            if _probe:
+                _before_cat = torch.cuda.memory_allocated()
             colors = torch.cat([self.splats["sh0"], shN_computed], 1)  # [N, K, 3]
+            if _probe:
+                _after_cat = torch.cuda.memory_allocated()
+                print(f"  [PEAK] after cat (colors alloc): {(_after_cat - _before_cat)/1e6:.1f} MB  total: {_after_cat/1e6:.1f} MB")
 
         if rasterize_mode is None:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
         if camera_model is None:
             camera_model = self.cfg.camera_model
+
+        if getattr(self, "_mem_probe_this_step", False):
+            _before_raster = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
         render_colors, render_alphas, info = rasterization(
             means=means,
             quats=quats,
@@ -701,6 +710,13 @@ class Runner:
             with_eval3d=self.cfg.with_eval3d,
             **kwargs,
         )
+        if getattr(self, "_mem_probe_this_step", False):
+            torch.cuda.synchronize()
+            _after_raster = torch.cuda.memory_allocated()
+            _raster_peak = torch.cuda.max_memory_allocated()
+            print(f"  [PEAK] after rasterization: {_after_raster/1e6:.1f} MB  (peak during: {_raster_peak/1e6:.1f} MB  raster_interm: {(_raster_peak - _before_raster)/1e6:.1f} MB)")
+            print(f"  [PEAK] colors freed by raster? before={_before_raster/1e6:.1f}  after={_after_raster/1e6:.1f}  delta={(_after_raster-_before_raster)/1e6:.1f} MB")
+
         if masks is not None:
             render_colors[~masks] = 0
 
