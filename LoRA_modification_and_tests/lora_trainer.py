@@ -460,6 +460,9 @@ class Runner:
         if not cfg.disable_dynamic_rank:
             self._init_bucket_tensors()
 
+        # OUR CHANGE: Memory probe at init (before optimizer states are populated)
+        self.probe_memory_breakdown("post-init (no optimizer state yet)")
+
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
 
@@ -586,6 +589,134 @@ class Runner:
 
         # Track if Gaussians are frozen (for controller distillation)
         self._gaussians_frozen = False
+
+    def probe_memory_breakdown(self, label: str = ""):
+        """Print a detailed GPU memory breakdown for debugging LoRA savings.
+
+        Call this at any point (e.g. after init, after first step, after rank
+        promotion) to see exactly what is on the GPU and what would be there in
+        the simple (full-shN) baseline.
+        """
+        cfg = self.cfg
+        device = self.device
+        MB = 1024 ** 2
+        N = len(self.splats["means"])
+        shN_bands = (cfg.sh_degree + 1) ** 2 - 1  # 15 for SH3
+
+        header = f"\n{'='*70}\nMEMORY PROBE{(' — ' + label) if label else ''}\n{'='*70}"
+        print(header)
+
+        # ── 1. Splat parameters ───────────────────────────────────────────────
+        print("\n[Splat parameters]")
+        splat_total = 0
+        for name, param in self.splats.items():
+            mb = param.numel() * 4 / MB
+            splat_total += mb
+            grad_str = "req_grad" if param.requires_grad else "no_grad "
+            print(f"  {name:<20s} shape={str(list(param.shape)):<22s} {grad_str}  {mb:8.3f} MB")
+        print(f"  {'TOTAL':<20s} {splat_total:8.3f} MB")
+
+        # ── 2. Splat Adam optimizer states ────────────────────────────────────
+        print("\n[Splat optimizer states (exp_avg + exp_avg_sq)]")
+        optim_total = 0
+        for name, opt in self.optimizers.items():
+            state_mb = 0.0
+            for pg in opt.param_groups:
+                for p in pg["params"]:
+                    if p in opt.state:
+                        for key in ["exp_avg", "exp_avg_sq"]:
+                            if key in opt.state[p]:
+                                state_mb += opt.state[p][key].numel() * 4 / MB
+            optim_total += state_mb
+            print(f"  {name:<20s} {state_mb:8.3f} MB")
+        print(f"  {'TOTAL':<20s} {optim_total:8.3f} MB")
+
+        # ── 3. lora_B ─────────────────────────────────────────────────────────
+        lora_B_mb = self.lora_B.numel() * 4 / MB
+        lora_B_optim_mb = 0.0
+        for opt in self.lora_optimizers:
+            if self.lora_B in opt.state:
+                for key in ["exp_avg", "exp_avg_sq"]:
+                    if key in opt.state[self.lora_B]:
+                        lora_B_optim_mb += opt.state[self.lora_B][key].numel() * 4 / MB
+        print(f"\n[lora_B]  shape={list(self.lora_B.shape)}  param={lora_B_mb:.3f} MB  optim_state={lora_B_optim_mb:.3f} MB")
+
+        # ── 4. lora_A buckets ─────────────────────────────────────────────────
+        if not cfg.disable_dynamic_rank:
+            buckets = [cfg.lora_min_rank, 8, cfg.lora_max_rank]
+            print("\n[lora_A buckets (dynamic rank)]")
+            lora_A_param_total = 0.0
+            lora_A_optim_total = 0.0
+            for r in buckets:
+                param = self.lora_A_buckets[r]
+                n_r = len(self.lora_A_bucket_indices[r])
+                frac = n_r / max(N, 1)
+                p_mb = param.numel() * 4 / MB
+                o_mb = 0.0
+                opt = self.lora_A_bucket_optims[r]
+                if param in opt.state:
+                    for key in ["exp_avg", "exp_avg_sq"]:
+                        if key in opt.state[param]:
+                            o_mb += opt.state[param][key].numel() * 4 / MB
+                lora_A_param_total += p_mb
+                lora_A_optim_total += o_mb
+                print(f"  rank={r:>2d}  n={n_r:>8d} ({frac:5.1%})  "
+                      f"param={p_mb:8.3f} MB  optim_state={o_mb:8.3f} MB")
+            print(f"  {'TOTAL':<35s} param={lora_A_param_total:8.3f} MB  optim_state={lora_A_optim_total:8.3f} MB")
+
+            # Avg effective rank
+            avg_rank = sum(
+                len(self.lora_A_bucket_indices[r]) * r for r in buckets
+            ) / max(N, 1)
+            print(f"  Avg effective rank: {avg_rank:.2f}")
+        else:
+            # Static mode
+            p = self.splats["lora_A"]
+            lora_A_param_total = p.numel() * 4 / MB
+            lora_A_optim_total = 0.0
+            opt = self.optimizers.get("lora_A")
+            if opt is not None and p in opt.state:
+                for key in ["exp_avg", "exp_avg_sq"]:
+                    if key in opt.state[p]:
+                        lora_A_optim_total += opt.state[p][key].numel() * 4 / MB
+            print(f"\n[lora_A static]  shape={list(p.shape)}  param={lora_A_param_total:.3f} MB  optim_state={lora_A_optim_total:.3f} MB")
+
+        # ── 5. Comparison: LoRA vs baseline shN ───────────────────────────────
+        print("\n[Comparison vs full-shN baseline]")
+        shN_floats = N * shN_bands * 3
+        baseline_param_mb  = shN_floats * 4 / MB
+        baseline_optim_mb  = 2 * shN_floats * 4 / MB
+        baseline_total_mb  = baseline_param_mb + baseline_optim_mb
+        lora_total_mb      = lora_A_param_total + lora_A_optim_total + lora_B_mb + lora_B_optim_mb
+        print(f"  Baseline shN     : param={baseline_param_mb:8.2f} MB  optim={baseline_optim_mb:8.2f} MB  total={baseline_total_mb:8.2f} MB")
+        print(f"  LoRA shN equiv   : param+optim total={lora_total_mb:8.2f} MB")
+        print(f"  Expected savings : {baseline_total_mb - lora_total_mb:8.2f} MB")
+
+        # ── 6. Actual GPU allocation ──────────────────────────────────────────
+        allocated_mb  = torch.cuda.memory_allocated(device) / MB
+        reserved_mb   = torch.cuda.memory_reserved(device) / MB
+        peak_mb       = torch.cuda.max_memory_allocated(device) / MB
+        print(f"\n[GPU memory]")
+        print(f"  Currently allocated : {allocated_mb:8.2f} MB")
+        print(f"  Currently reserved  : {reserved_mb:8.2f} MB")
+        print(f"  Peak allocated      : {peak_mb:8.2f} MB  ← this is what 'mem' stat reports")
+
+        # ── 7. lora_A_dense warning (exists every training step before del) ──
+        if "lora_A_dense" in self.splats:
+            dense_mb = self.splats["lora_A_dense"].numel() * 4 / MB
+            print(f"\n[WARNING] lora_A_dense is currently in splats: "
+                  f"shape={list(self.splats['lora_A_dense'].shape)}, {dense_mb:.2f} MB")
+            print(f"  This [N, max_rank] tensor exists every training step (added before")
+            print(f"  densification strategy, deleted after) — it duplicates lora_A memory.")
+
+        # ── 8. Unaccounted gap ────────────────────────────────────────────────
+        # Sum up all known tensors to see what's unaccounted for
+        known_mb = splat_total + optim_total + lora_B_mb + lora_B_optim_mb + lora_A_param_total + lora_A_optim_total
+        print(f"\n[Unaccounted]")
+        print(f"  Tracked tensors     : {known_mb:8.2f} MB")
+        print(f"  Allocated           : {allocated_mb:8.2f} MB")
+        print(f"  Gap (overhead, activations, etc.): {allocated_mb - known_mb:8.2f} MB")
+        print(f"{'='*70}\n")
 
     def freeze_gaussians(self):
         """Freeze all Gaussian parameters for controller distillation.
@@ -1495,11 +1626,24 @@ class Runner:
             # OUR CHANGE: After densification, N may have changed. Rebuild bucket tensors
             # from the dense splat that was sized alongside other params by the strategy.
             if not cfg.disable_dynamic_rank:
+                # OUR CHANGE: Probe BEFORE deleting lora_A_dense to expose its memory cost.
+                if step == 0 and world_rank == 0:
+                    lora_dense_mb = self.splats["lora_A_dense"].numel() * 4 / 1024**2
+                    print(f"\n[PROBE] lora_A_dense is in splats right now: "
+                          f"shape={list(self.splats['lora_A_dense'].shape)}, "
+                          f"{lora_dense_mb:.2f} MB  ← this exists EVERY step before del")
+                    print(f"[PROBE] GPU allocated with lora_A_dense: "
+                          f"{torch.cuda.memory_allocated() / 1024**2:.2f} MB\n")
                 N_current = len(self.splats["means"])
                 if N_current != self.N_prev_for_densification:
                     self._rebuild_buckets_from_dense(self.splats["lora_A_dense"].data)
                 del self.splats["lora_A_dense"]
                 self.N_prev_for_densification = N_current
+
+            # OUR CHANGE: Memory probe after first step (optimizer states now populated,
+            # lora_A_dense already deleted, so this shows steady-state cost).
+            if step == 1 and world_rank == 0:
+                self.probe_memory_breakdown("after step 1 (optimizer states populated)")
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
