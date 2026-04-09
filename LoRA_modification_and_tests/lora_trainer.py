@@ -1642,8 +1642,8 @@ class Runner:
 
             # OUR CHANGE: Memory probe after first step (optimizer states now populated,
             # lora_A_dense already deleted, so this shows steady-state cost).
-            if step == 1 and world_rank == 0:
-                self.probe_memory_breakdown("after step 1 (optimizer states populated)")
+            if step == max_steps - 1 and world_rank == 0:
+                self.probe_memory_breakdown(f"after step {max_steps - 1} (final step)")
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
