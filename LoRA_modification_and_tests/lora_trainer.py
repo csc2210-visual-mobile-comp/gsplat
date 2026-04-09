@@ -956,6 +956,14 @@ class Runner:
             new_buckets[new_r] = param
             new_optims[new_r] = optim
 
+        # Explicitly clear old optimizer state before replacing to break the
+        # param_groups→param→state cycle that prevents CPython refcount GC from
+        # freeing the old CUDA tensors (otherwise ~3×[old_N, rank] leaks until
+        # gc.collect() runs).
+        for r in [cfg.lora_min_rank, 8, cfg.lora_max_rank]:
+            self.lora_A_bucket_optims[r].state.clear()
+            self.lora_A_bucket_optims[r].param_groups.clear()
+
         self.lora_A_bucket_indices = new_bucket_indices
         self.lora_A_buckets = new_buckets
         self.lora_A_bucket_optims = new_optims
@@ -1499,6 +1507,7 @@ class Runner:
                 if N_current != self.N_prev_for_densification:
                     self._rebuild_buckets_from_dense(self.splats["lora_A_dense"].data)
                 del self.splats["lora_A_dense"]
+                _lora_A_dense_for_densification = None  # drop ref so CUDA block is freed immediately
                 self.N_prev_for_densification = N_current
 
             # eval the full set
