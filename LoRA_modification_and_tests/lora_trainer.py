@@ -460,8 +460,7 @@ class Runner:
         if not cfg.disable_dynamic_rank:
             self._init_bucket_tensors()
 
-        # OUR CHANGE: Memory probe at init (before optimizer states are populated)
-        self.probe_memory_breakdown("post-init (no optimizer state yet)")
+        # (probe removed — see targeted probes in train() and rasterize_splats())
 
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
@@ -709,13 +708,72 @@ class Runner:
             print(f"  This [N, max_rank] tensor exists every training step (added before")
             print(f"  densification strategy, deleted after) — it duplicates lora_A memory.")
 
-        # ── 8. Unaccounted gap ────────────────────────────────────────────────
-        # Sum up all known tensors to see what's unaccounted for
+        # ── 8. Unaccounted gap + gc scan ──────────────────────────────────────
+        import gc
         known_mb = splat_total + optim_total + lora_B_mb + lora_B_optim_mb + lora_A_param_total + lora_A_optim_total
         print(f"\n[Unaccounted]")
         print(f"  Tracked tensors     : {known_mb:8.2f} MB")
         print(f"  Allocated           : {allocated_mb:8.2f} MB")
-        print(f"  Gap (overhead, activations, etc.): {allocated_mb - known_mb:8.2f} MB")
+        print(f"  Gap                 : {allocated_mb - known_mb:8.2f} MB")
+
+        # Build set of data_ptrs for all tensors we already know about, so we
+        # can skip them in the gc scan and only surface the unknown ones.
+        known_ptrs = set()
+        for param in self.splats.values():
+            known_ptrs.add(param.data_ptr())
+        for opt in self.optimizers.values():
+            for pg in opt.param_groups:
+                for p in pg["params"]:
+                    known_ptrs.add(p.data_ptr())
+                    if p in opt.state:
+                        for v in opt.state[p].values():
+                            if isinstance(v, torch.Tensor):
+                                known_ptrs.add(v.data_ptr())
+        known_ptrs.add(self.lora_B.data_ptr())
+        for opt in self.lora_optimizers:
+            if self.lora_B in opt.state:
+                for v in opt.state[self.lora_B].values():
+                    if isinstance(v, torch.Tensor):
+                        known_ptrs.add(v.data_ptr())
+        if not cfg.disable_dynamic_rank:
+            for r in [cfg.lora_min_rank, 8, cfg.lora_max_rank]:
+                p = self.lora_A_buckets[r]
+                known_ptrs.add(p.data_ptr())
+                opt = self.lora_A_bucket_optims[r]
+                if p in opt.state:
+                    for v in opt.state[p].values():
+                        if isinstance(v, torch.Tensor):
+                            known_ptrs.add(v.data_ptr())
+
+        # Walk all live Python objects and find CUDA tensors not in known_ptrs.
+        # Group by shape+dtype so the output isn't overwhelming.
+        from collections import Counter
+        unknown: dict[tuple, float] = {}  # (shape, dtype) -> total MB
+        seen_ptrs = set()
+        for obj in gc.get_objects():
+            try:
+                if not isinstance(obj, torch.Tensor):
+                    continue
+                if not obj.is_cuda:
+                    continue
+                ptr = obj.data_ptr()
+                if ptr in known_ptrs or ptr in seen_ptrs:
+                    continue
+                seen_ptrs.add(ptr)
+                key = (tuple(obj.shape), str(obj.dtype))
+                unknown[key] = unknown.get(key, 0.0) + obj.numel() * obj.element_size() / MB
+            except Exception:
+                pass
+
+        if unknown:
+            print(f"\n[Unknown CUDA tensors (not in tracked params/states)]")
+            for (shape, dtype), size_mb in sorted(unknown.items(), key=lambda x: -x[1])[:20]:
+                print(f"  shape={str(shape):<30s} dtype={dtype:<15s} {size_mb:8.3f} MB")
+            if len(unknown) > 20:
+                print(f"  ... and {len(unknown) - 20} more shapes")
+            print(f"  Total unknown: {sum(unknown.values()):.2f} MB")
+        else:
+            print(f"\n  No unknown CUDA tensors found.")
         print(f"{'='*70}\n")
 
     def freeze_gaussians(self):
@@ -777,6 +835,15 @@ class Runner:
                 buckets = [self.cfg.lora_min_rank, 8, self.cfg.lora_max_rank]
                 N = self.splats["current_ranks"].shape[0]
                 shN_computed = torch.zeros(N, self.lora_B.shape[1], device=self.device)
+                # PROBE H1: shN_computed is a brand-new [N, 45] allocation that does not
+                # exist in simple_trainer (where shN is a persistent parameter).
+                # It lives from here until after loss.backward(), inflating peak memory.
+                if getattr(self, '_probe_shN_computed', False):
+                    shN_mb = shN_computed.numel() * 4 / 1024**2
+                    print(f"[PROBE H1] shN_computed just allocated: "
+                          f"shape={list(shN_computed.shape)}, {shN_mb:.1f} MB  "
+                          f"| GPU now: {torch.cuda.memory_allocated(self.device)/1024**2:.1f} MB")
+                    self._probe_shN_computed = False  # fire once
                 for r in buckets:
                     idxs = self.lora_A_bucket_indices[r]
                     if len(idxs) == 0:
@@ -1626,24 +1693,26 @@ class Runner:
             # OUR CHANGE: After densification, N may have changed. Rebuild bucket tensors
             # from the dense splat that was sized alongside other params by the strategy.
             if not cfg.disable_dynamic_rank:
-                # OUR CHANGE: Probe BEFORE deleting lora_A_dense to expose its memory cost.
+                # PROBE H2: lora_A_dense [N, max_rank] is created every step unconditionally,
+                # even though densification only fires every ~100 steps. Measure it here
+                # (before del) to confirm it inflates max_memory_allocated().
                 if step == 0 and world_rank == 0:
                     lora_dense_mb = self.splats["lora_A_dense"].numel() * 4 / 1024**2
-                    print(f"\n[PROBE] lora_A_dense is in splats right now: "
-                          f"shape={list(self.splats['lora_A_dense'].shape)}, "
-                          f"{lora_dense_mb:.2f} MB  ← this exists EVERY step before del")
-                    print(f"[PROBE] GPU allocated with lora_A_dense: "
-                          f"{torch.cuda.memory_allocated() / 1024**2:.2f} MB\n")
+                    gpu_with_dense = torch.cuda.memory_allocated() / 1024**2
+                    print(f"\n[PROBE H2] lora_A_dense: shape={list(self.splats['lora_A_dense'].shape)}, "
+                          f"{lora_dense_mb:.1f} MB — created EVERY step, exists until after strategy step")
+                    print(f"           GPU allocated right now (with dense): {gpu_with_dense:.1f} MB\n")
                 N_current = len(self.splats["means"])
                 if N_current != self.N_prev_for_densification:
                     self._rebuild_buckets_from_dense(self.splats["lora_A_dense"].data)
                 del self.splats["lora_A_dense"]
                 self.N_prev_for_densification = N_current
 
-            # OUR CHANGE: Memory probe after first step (optimizer states now populated,
-            # lora_A_dense already deleted, so this shows steady-state cost).
+            # Final-step probe: steady-state breakdown (lora_A_dense and shN_computed
+            # are both already freed here, so this shows the floor memory).
             if step == max_steps - 1 and world_rank == 0:
-                self.probe_memory_breakdown(f"after step {max_steps - 1} (final step)")
+                self._probe_shN_computed = True  # arm H1 probe for next forward call
+                self.probe_memory_breakdown(f"step {max_steps - 1} steady-state (floor)")
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
