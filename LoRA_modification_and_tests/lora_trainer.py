@@ -825,12 +825,12 @@ class Runner:
         cfg = self.cfg
         N = self.splats["current_ranks"].shape[0]
         buckets = [cfg.lora_min_rank, 8, cfg.lora_max_rank]
-        dense = torch.zeros(N, cfg.lora_max_rank, device=self.device)
+        dense = torch.zeros(N, cfg.lora_max_rank, device=self.device, dtype=torch.float16)
         for r in buckets:
             idxs = self.lora_A_bucket_indices[r]
             if len(idxs) == 0:
                 continue
-            dense[idxs, :r] = self.lora_A_buckets[r].data
+            dense[idxs, :r] = self.lora_A_buckets[r].data.half()
         return dense
 
     @torch.no_grad()
@@ -861,7 +861,7 @@ class Runner:
         for r in buckets:
             idxs = (ranks == r).nonzero(as_tuple=True)[0]
             new_bucket_indices[r] = idxs
-            data = dense[idxs, :r].clone() if len(idxs) > 0 else torch.zeros(0, r, device=device)
+            data = dense[idxs, :r].float().clone() if len(idxs) > 0 else torch.zeros(0, r, device=device)
             param = torch.nn.Parameter(data)
             new_buckets[r] = param
             new_optims[r] = torch.optim.Adam([param], lr=lr, betas=betas, eps=eps)
@@ -906,7 +906,7 @@ class Runner:
         new_bucket_indices = {}
         new_buckets = {}
         new_optims = {}
-
+    
         for new_r in buckets:
             new_idxs = (new_r_per_gaussian == new_r).nonzero(as_tuple=True)[0]
             new_bucket_indices[new_r] = new_idxs
@@ -934,7 +934,7 @@ class Runner:
 
                     # For newly added columns (uprank), init with fresh noise
                     if new_r > old_r:
-                        new_data[pos, old_r:new_r] = torch.randn(len(pos), new_r - old_r, device=device) * 0.01
+                        new_data[pos, old_r:new_r] = torch.zeros(len(pos), new_r - old_r, device=device) 
 
                     # Carry over Adam state for retained columns
                     old_optim = self.lora_A_bucket_optims[old_r]
@@ -1196,7 +1196,7 @@ class Runner:
                         # new columns (upranked) get fresh noise — all handled in the method.
                         self._update_buckets_for_rank_change(new_r_per_gaussian)
 
-                        self.splats["lora_grad_accum"].zero_()
+                        self.splats["lora_grad_accum"].mul_(0.5)
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
