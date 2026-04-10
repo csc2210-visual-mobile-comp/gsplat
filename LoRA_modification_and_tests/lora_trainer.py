@@ -906,7 +906,13 @@ class Runner:
         new_bucket_indices = {}
         new_buckets = {}
         new_optims = {}
-    
+        current_step = torch.tensor(0.0, device=device)
+        for temp_optim in self.lora_A_bucket_optims.values():
+            if len(temp_optim.state) > 0:
+                state_dict = next(iter(temp_optim.state.values()))
+                if "step" in state_dict:
+                    current_step = state_dict["step"].clone()
+                    break
         for new_r in buckets:
             new_idxs = (new_r_per_gaussian == new_r).nonzero(as_tuple=True)[0]
             new_bucket_indices[new_r] = new_idxs
@@ -932,10 +938,6 @@ class Runner:
                     # Carry over parameter data for retained columns
                     new_data[pos, :keep] = self.lora_A_buckets[old_r].data[rows, :keep]
 
-                    # For newly added columns (uprank), init with fresh noise
-                    if new_r > old_r:
-                        new_data[pos, old_r:new_r] = torch.zeros(len(pos), new_r - old_r, device=device) 
-
                     # Carry over Adam state for retained columns
                     old_optim = self.lora_A_bucket_optims[old_r]
                     old_param = self.lora_A_buckets[old_r]
@@ -949,12 +951,16 @@ class Runner:
             # Manually set optimizer state so carried-over momentum is preserved
             # while bias correction restarts (step=0)
             optim.state[param] = {
-                "step": torch.tensor(0.0),
+                "step": current_step,
                 "exp_avg": new_exp_avg,
                 "exp_avg_sq": new_exp_avg_sq,
             }
             new_buckets[new_r] = param
             new_optims[new_r] = optim
+
+        for r in [cfg.lora_min_rank, 8, cfg.lora_max_rank]:
+            self.lora_A_bucket_optims[r].state.clear()
+            self.lora_A_bucket_optims[r].param_groups.clear()
 
         self.lora_A_bucket_indices = new_bucket_indices
         self.lora_A_buckets = new_buckets
@@ -1165,18 +1171,24 @@ class Runner:
                     freeze_step = self.cfg.strategy.refine_stop_iter
                 else:
                     freeze_step = 15000
-                
+                # if step == 4000: # run the analysis
                 if step > 0 and step % allocation_interval == 0 and step <= freeze_step:
                     with torch.no_grad():
                         grad_frustration = self.splats["lora_grad_accum"] / (self.splats["current_ranks"].data + 1e-8)
 
-                        top_percentile = 1.0 - cfg.lora_quota[0]
-                        bottom_percentile = cfg.lora_quota[2]
-                        top_thresh = torch.quantile(grad_frustration, top_percentile)
-                        bottom_thresh = torch.quantile(grad_frustration, bottom_percentile)
+                        N_gs = grad_frustration.shape[0]
+                        k_high = int(N_gs * cfg.lora_quota[0])
+                        k_low = int(N_gs * cfg.lora_quota[2])
 
-                        top_mask = grad_frustration >= top_thresh
-                        bottom_mask = grad_frustration <= bottom_thresh
+                        _, top_idx = torch.topk(grad_frustration.squeeze(), k_high)
+                        _, bottom_idx = torch.topk(-grad_frustration.squeeze(), k_low)
+
+                        top_mask = torch.zeros(N_gs, dtype=torch.bool, device=self.device)
+                        bottom_mask = torch.zeros(N_gs, dtype=torch.bool, device=self.device)
+                        
+                        top_mask[top_idx] = True
+                        bottom_mask[bottom_idx] = True
+                        bottom_mask &= ~top_mask 
                         middle_mask = ~(top_mask | bottom_mask)
 
                         # Compute new rank per Gaussian BEFORE updating current_ranks,
@@ -1499,6 +1511,7 @@ class Runner:
                 if N_current != self.N_prev_for_densification:
                     self._rebuild_buckets_from_dense(self.splats["lora_A_dense"].data)
                 del self.splats["lora_A_dense"]
+                _lora_A_dense_for_densification = None
                 self.N_prev_for_densification = N_current
 
             # eval the full set
@@ -1880,6 +1893,16 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
             pp_state = ckpts[0].get("post_processing")
             if pp_state is not None:
                 runner.post_processing_module.load_state_dict(pp_state)
+
+        if hasattr(runner, "lora_B") and "lora_B" in ckpts[0]:
+            runner.lora_B.data = ckpts[0]["lora_B"].to(runner.device)
+            
+        if not cfg.disable_dynamic_rank and "lora_A_buckets" in ckpts[0]:
+            runner.lora_A_bucket_indices = ckpts[0]["lora_A_bucket_indices"]
+            for r in [cfg.lora_min_rank, 8, cfg.lora_max_rank]:
+                if r in ckpts[0]["lora_A_buckets"]:
+                    runner.lora_A_buckets[r].data = ckpts[0]["lora_A_buckets"][r].to(runner.device)
+
         step = ckpts[0]["step"]
         runner.eval(step=step)
         runner.render_traj(step=step)
