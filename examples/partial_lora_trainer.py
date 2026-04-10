@@ -400,9 +400,9 @@ def create_splats_with_optimizers(
         lora_rank = lora_dim
 
     # Add LoRA A
-    params.append(("A", torch.nn.Parameter(torch.zeros(N, lora_rank)), lora_lr))
+    params.append(("A", torch.nn.Parameter(torch.randn(N, lora_rank) * 0.01), lora_lr))
     # Shared LoRA B
-    B = torch.nn.Parameter(torch.zeros(lora_rank, lora_dim, device=device))
+    B = torch.nn.Parameter(torch.randn(lora_rank, lora_dim, device=device) * 0.01)
 
     # Freeze base tensors that are controlled by LoRA.
     frozen_names = {name for name, _ in lora_layout}
