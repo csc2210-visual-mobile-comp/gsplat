@@ -29,15 +29,15 @@
        for Memory-Efficient 3D Gaussian Splatting Training}
 
 \author{\TODO{Author One}}
-\affiliation{\institution{University of Toronto}}
+\affiliation{\institution{University of Toronto}\country{Canada}}
 \email{author1@mail.utoronto.ca}
 
 \author{\TODO{Author Two}}
-\affiliation{\institution{University of Toronto}}
+\affiliation{\institution{University of Toronto}\country{Canada}}
 \email{author2@mail.utoronto.ca}
 
 \author{\TODO{Author Three}}
-\affiliation{\institution{University of Toronto}}
+\affiliation{\institution{University of Toronto}\country{Canada}}
 \email{author3@mail.utoronto.ca}
 
 \begin{abstract}
@@ -155,7 +155,77 @@ bottlenecks without reducing the overall Gaussian count or sacrificing rendering
 \section{Methodology}
 \label{sec:method}
 
-\TODO{Fill in}
+Our approach replaces full-rank Gaussian parameter tensors with a shared low-rank
+factorization during training, extending the standard 3DGS training pipeline with
+the modifications described below.
+
+\subsection{Low-Rank Parameterization}
+
+For a scene with $N$ Gaussian primitives, consider a target parameter block
+(e.g., the spherical harmonic coefficients) whose per-Gaussian contribution
+has dimension $D$. Instead of optimizing an unconstrained $[N \times D]$
+parameter matrix, we decompose the \emph{adjustment} to a frozen base as:
+
+\[
+  \Delta = A B, \quad A \in \mathbb{R}^{N \times r},\; B \in \mathbb{R}^{r \times D},
+\]
+
+where $r \ll D$ is the rank. $A$ is a per-Gaussian matrix (one row per
+primitive), and $B$ is a \emph{shared} projection matrix across all Gaussians.
+The effective parameter used during rasterization is then:
+\[
+  \theta_{\text{eff}} = \theta_{\text{base}} + \Delta,
+\]
+where $\theta_{\text{base}}$ is frozen after initialization. $A$ is optimized
+per-Gaussian while $B$ is optimized globally with a separate optimizer, so
+the two factors receive independent gradient updates.
+
+The base tensors targeted by LoRA have their gradients disabled, so no gradient
+buffers or Adam optimizer states are allocated for them. The delta is
+materialized at each forward pass and added to the frozen base before rasterization.
+
+\subsection{Flexible Target Selection}
+
+The factorization is not restricted to spherical harmonic colors. Any subset of
+Gaussian attributes --- colors, opacities, positions, scales, rotations, or
+appearance features --- can be designated as LoRA targets. This allows controlled
+ablations over which attributes benefit from a low-rank constraint.
+
+For the default setting (colors only), the full SH coefficient tensor
+($[N \times 16 \times 3]$ for degree-3 SH) is frozen and replaced by the LoRA
+delta, directly targeting the largest contributor to per-Gaussian memory.
+
+As a concrete example, consider targeting colors (degree-3 SH, $D_c = 48$),
+scales ($D_s = 3$), and rotations ($D_q = 4$), giving a combined dimension
+$D = 55$. The shared matrix $B \in \mathbb{R}^{r \times 55}$ is partitioned
+column-wise as $B = [B_c \mid B_s \mid B_q]$, where
+$B_c \in \mathbb{R}^{r \times 48}$, $B_s \in \mathbb{R}^{r \times 3}$, and
+$B_q \in \mathbb{R}^{r \times 4}$. For Gaussian $i$ with per-Gaussian row
+$a_i \in \mathbb{R}^{r}$, the effective attributes are:
+\begin{align}
+  \theta^{(i)}_{\text{color}} &= \theta^{(i)}_{\text{color, base}} + a_i B_c, \\
+  \theta^{(i)}_{\text{scale}} &= \theta^{(i)}_{\text{scale, base}} + a_i B_s, \\
+  \theta^{(i)}_{\text{quat}}  &= \theta^{(i)}_{\text{quat, base}}  + a_i B_q.
+\end{align}
+The key insight is that $a_i$ is \emph{shared} across all targeted attributes:
+the same low-dimensional latent vector for each Gaussian jointly modulates its
+color response, size, and orientation through the respective column blocks of $B$.
+
+\subsection{LoRA-Aware Densification}
+
+Standard densification (clone, split, prune) must be extended to account for
+the LoRA parameterization: when a Gaussian is cloned or split, the corresponding
+rows of $A$ must be duplicated accordingly, and when Gaussians are pruned, the
+corresponding rows must be removed. We use a LoRA-aware densification strategy
+that wraps the default densification logic with this additional bookkeeping.
+
+\subsection{Effective Parameter Computation}
+
+At each training step, $\theta_{\text{eff}}$ is computed for all targeted
+attributes and passed directly to the rasterizer. Regularization losses (opacity
+and scale penalties) also operate on the effective parameters when the
+corresponding attribute is LoRA-targeted, ensuring that penalization is applied
+to the quantities that actually influence rendering rather than the frozen base.
 
 %% -------------------------------------------------------
 \section{Observations and Motivation}
