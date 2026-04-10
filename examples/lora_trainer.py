@@ -297,19 +297,19 @@ def create_splats_with_optimizers(
         colors[:, 0, :] = rgb_to_sh(rgbs)
         params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
         params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
-        params.append(("A", torch.nn.Parameter(torch.zeros(N, lora_rank)), lora_lr))
-        B = torch.nn.Parameter(torch.zeros(lora_rank, K * d).to(device))
+        params.append(("A", torch.nn.Parameter(torch.randn(N, lora_rank) * 0.01), lora_lr))
+        B = torch.nn.Parameter(torch.randn(lora_rank, K * d).to(device) * 0.01)
     else:
         if lora_rank is None:
             lora_rank = feature_dim  # default low rank
-    
+
         features = torch.rand(N, feature_dim, device=device)
         params.append(("features", torch.nn.Parameter(features), sh0_lr))
         base_colors = torch.logit(rgbs).to(device)
-        params.append(("colors", torch.nn.Parameter(base_colors), sh0_lr))    
-        params.append(("A", torch.nn.Parameter(torch.zeros(N, lora_rank, device=device)), lora_lr))
+        params.append(("colors", torch.nn.Parameter(base_colors), sh0_lr))
+        params.append(("A", torch.nn.Parameter(torch.randn(N, lora_rank, device=device) * 0.01), lora_lr))
         B = torch.nn.Parameter(
-            torch.zeros(lora_rank, feature_dim, device=device)
+            torch.randn(lora_rank, feature_dim, device=device) * 0.01
         )
     
     def turn_off_grad(params: list[tuple[str, torch.nn.Parameter, float]], criteria: List[str]):
