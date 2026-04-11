@@ -29,15 +29,15 @@
        for Memory-Efficient 3D Gaussian Splatting Training}
 
 \author{\TODO{Author One}}
-\affiliation{\institution{University of Toronto}}
+\affiliation{\institution{University of Toronto}\country{Canada}}
 \email{author1@mail.utoronto.ca}
 
 \author{\TODO{Author Two}}
-\affiliation{\institution{University of Toronto}}
+\affiliation{\institution{University of Toronto}\country{Canada}}
 \email{author2@mail.utoronto.ca}
 
 \author{\TODO{Author Three}}
-\affiliation{\institution{University of Toronto}}
+\affiliation{\institution{University of Toronto}\country{Canada}}
 \email{author3@mail.utoronto.ca}
 
 \begin{abstract}
@@ -155,7 +155,171 @@ bottlenecks without reducing the overall Gaussian count or sacrificing rendering
 \section{Methodology}
 \label{sec:method}
 
-\TODO{Fill in}
+%% -------------------------------------------------------
+\subsection{Low-Rank Parameterization}
+
+For a scene with $N$ Gaussian primitives, consider a target parameter block
+(e.g., the higher-order spherical harmonic coefficients) whose per-Gaussian
+contribution has dimension $D$. Instead of optimizing an unconstrained
+$[N \times D]$ parameter matrix, we decompose the \emph{adjustment} to a
+frozen base as:
+\[
+  \Delta = A B, \quad A \in \mathbb{R}^{N \times r},\; B \in \mathbb{R}^{r \times D},
+\]
+where $r \ll D$ is the rank. $A$ is a per-Gaussian matrix (one row per
+primitive), and $B$ is a \emph{shared} projection matrix across all Gaussians.
+The effective parameter used during rasterization is then:
+\[
+  \theta_{\text{eff}} = \theta_{\text{base}} + \Delta,
+\]
+where $\theta_{\text{base}}$ is frozen after initialization. $A$ is optimized
+per-Gaussian while $B$ is optimized globally with a separate optimizer.
+
+%% -------------------------------------------------------
+\subsection{Static LoRA on Target Selection}
+\label{sec:static_lora}
+
+Our first instantiation applies the low-rank parameterization with a fixed
+rank $r$ to a chosen subset of Gaussian attributes throughout training.
+The zero-order SH coefficient (band 0, encoding the mean color) is always
+left as a directly optimized parameter.
+
+\subsubsection{Flexible Target Selection}
+
+The parameterization supports any subset of Gaussian attributes as LoRA
+targets, enabling controlled ablations over which attributes benefit from a
+low-rank constraint. As a concrete example, consider jointly targeting colors
+(degree-3 SH, $D_c = 48$), scales ($D_s = 3$), and rotations ($D_q = 4$),
+giving a combined dimension $D = 55$. The shared matrix
+$B \in \mathbb{R}^{r \times 55}$ is partitioned column-wise as
+$B = [B_c \mid B_s \mid B_q]$. For Gaussian $i$ with per-Gaussian row
+$a_i \in \mathbb{R}^{r}$, the effective attributes are:
+\begin{align}
+  \theta^{(i)}_{\text{color}} &= \theta^{(i)}_{\text{color, base}} + a_i B_c, \\
+  \theta^{(i)}_{\text{scale}} &= \theta^{(i)}_{\text{scale, base}} + a_i B_s, \\
+  \theta^{(i)}_{\text{quat}}  &= \theta^{(i)}_{\text{quat, base}}  + a_i B_q.
+\end{align}
+The same low-dimensional latent vector $a_i$ jointly modulates all targeted
+attributes through the respective column blocks of $B$. The frozen base tensors
+have gradients disabled, so no gradient buffers or Adam optimizer states are
+allocated for them.
+
+\subsubsection{LoRA-Aware Densification}
+
+Standard densification (clone, split, prune) must be extended to account for
+the LoRA parameterization: when a Gaussian is cloned or split, the corresponding
+rows of $A$ must be duplicated; when Gaussians are pruned, those rows must be
+removed. We use a LoRA-aware densification strategy that wraps the default
+densification logic with this bookkeeping.
+
+\subsubsection{Effective Parameter Computation}
+
+At each training step, $\theta_{\text{eff}}$ is computed and passed directly
+to the rasterizer. Regularization losses also operate on the effective
+parameters when the corresponding attribute is LoRA-targeted, ensuring
+penalization is applied to the quantities that actually influence rendering.
+
+%% -------------------------------------------------------
+\subsection{Settling on Higher-Order SH}
+
+Through ablation we find that applying LoRA to geometry attributes (positions,
+scales, rotations) degrades reconstruction quality, as these attributes require
+precise, high-rank updates to represent sharp geometry. We therefore restrict
+LoRA to the higher-order SH coefficients (bands 1--3), targeting only the
+view-dependent color component. This is also the highest-leverage target from
+a memory standpoint, as the higher-order SH tensor dominates the per-Gaussian
+parameter budget.
+
+%% -------------------------------------------------------
+\subsection{Dynamic Rank Allocation via Gradient-Based Binning}
+\label{sec:dynamic_lora}
+
+The static approach assigns the same rank $r$ to every Gaussian regardless of
+its view-dependent complexity. We extend it with a dynamic rank mechanism that
+periodically reallocates rank across primitives based on observed gradient
+activity.
+
+\subsubsection{Rank Bins}
+
+Rather than tracking a continuous rank per Gaussian, we maintain three discrete
+rank bins: $r_{\min}$, $r_{\text{mid}} = 8$, and $r_{\max}$. All Gaussians
+are initialized in the $r_{\min}$ bin. Each bin owns a compact parameter tensor
+$A^{(r)} \in \mathbb{R}^{N_r \times r}$, where $N_r$ is the number of Gaussians
+currently assigned to rank $r$, together with its own Adam optimizer. Because
+the parameter and optimizer state tensors have dimension proportional to $N_r
+\cdot r$ rather than $N \cdot r_{\max}$, memory scales with \emph{actual} rank
+usage rather than the worst case.
+
+The shared matrix $B \in \mathbb{R}^{r_{\max} \times D}$ is defined at the
+maximum rank. For a Gaussian in bin $r$, only the first $r$ rows of $B$ are
+used:
+\[
+  \Delta^{(i)} = a^{(i)} \, B_{:r,\,:\,}, \quad a^{(i)} \in \mathbb{R}^{r}.
+\]
+
+\subsubsection{Gradient Accumulation}
+
+To measure how much representational capacity each Gaussian demands, we
+accumulate a per-Gaussian gradient magnitude after every backward pass.
+For Gaussian $i$ in bin $r$, the accumulated gradient is the sum of absolute
+gradients of its $A$ row:
+\[
+  g^{(i)} \mathrel{+}= \left\| \nabla_{a^{(i)}} \mathcal{L} \right\|_1.
+\]
+At the end of each allocation interval (one full pass over the training set),
+the accumulated gradient is normalized by the current rank to make it
+comparable across bins:
+\[
+  \tilde{g}^{(i)} = \frac{g^{(i)}}{r^{(i)}}.
+\]
+
+\subsubsection{Rank Reallocation}
+
+Reallocation is triggered once per epoch (one full pass over the training set)
+and is disabled after densification stops, allowing the rank distribution to
+stabilize for the remainder of training.
+
+\paragraph{Partitioning.}
+Given a quota $(q_{\text{top}},\, q_{\text{mid}},\, q_{\text{bot}})$ summing
+to 1, we compute quantile thresholds on the
+normalized accumulated gradient $\tilde{g}$ across all Gaussians and assign
+each primitive to a bin:
+\begin{itemize}
+  \item the top $q_{\text{top}}$ fraction (highest $\tilde{g}$) are assigned
+    rank $r_{\max}$,
+  \item the bottom $q_{\text{bot}}$ fraction (lowest $\tilde{g}$) are assigned
+    rank $r_{\min}$,
+  \item the remaining middle fraction are assigned $r_{\text{mid}}$.
+\end{itemize}
+The accumulated gradient buffer is then zeroed so the next interval measures
+fresh gradient activity.
+
+\paragraph{Rebuilding bin tensors.}
+After the new rank assignments are computed, the per-bin parameter tensors and
+their Adam optimizers are rebuilt. For each Gaussian, let $r_{\text{old}}$ and
+$r_{\text{new}}$ denote its rank before and after reallocation, and let
+$k = \min(r_{\text{old}}, r_{\text{new}})$ be the number of columns that
+remain active.
+\begin{itemize}
+  \item \emph{Retained columns} ($1, \ldots, k$): parameter values and Adam
+    first and second moment estimates are copied over from the old bin tensor.
+  \item \emph{New columns} ($k{+}1, \ldots, r_{\text{new}}$, upranked only):
+    parameter values are initialized with small random noise; Adam moments
+    are initialized to zero.
+  \item \emph{Dropped columns} ($k{+}1, \ldots, r_{\text{old}}$, downranked
+    only): parameter values and optimizer state are discarded.
+\end{itemize}
+Each new bin gets a fresh Adam optimizer whose step counter is reset to zero,
+so bias correction restarts while the carried-over momentum remains effective
+for retained columns.
+
+\subsubsection{Rank Heatmap}
+
+To visualize the learned rank distribution, we render a per-Gaussian heatmap
+by replacing each Gaussian's color with a blue-to-red colormap encoding its
+current rank (blue = $r_{\min}$, red = $r_{\max}$). This provides an
+interpretable view of which scene regions require high representational
+capacity for view-dependent appearance.
 
 %% -------------------------------------------------------
 \section{Observations and Motivation}
@@ -173,7 +337,56 @@ bottlenecks without reducing the overall Gaussian count or sacrificing rendering
 \section{Results}
 \label{sec:results}
 
-\TODO{Fill in}
+\subsection{Target Selection}
+
+We evaluate the effect of LoRA target selection on reconstruction quality
+across three scenes (Garden Spheres, Sedan, Toy Car), measuring PSNR (dB,
+higher is better). The full-rank SH3 baseline is trained without any LoRA
+modification.
+
+\begin{table}[h]
+\centering
+\caption{PSNR (dB) for different LoRA target configurations. \textbf{Bold}
+indicates the best result among color-targeting configurations per scene.
+Geometry-only rows are included for reference and are not candidates for
+memory reduction in our setting.}
+\label{tab:target_selection}
+\begin{tabular}{lccc}
+\toprule
+Target & Garden Spheres & Sedan & Toy Car \\
+\midrule
+Full-rank SH3 (baseline) & 23.29 & 25.16 & 25.01 \\
+\midrule
+Colors only              & 23.08 & \textbf{25.14} & 24.85 \\
+Colors + quats           & \textbf{23.10} & 25.02 & \textbf{24.87} \\
+Colors + opacities       & 22.95 & 25.05 & 24.78 \\
+Colors + scales          & 22.94 & 24.40 & 24.81 \\
+Colors + quats + scales  & 22.94 & 24.44 & 24.81 \\
+\midrule
+Quats + scales (ref.)           & 23.14 & 24.30 & 24.98 \\
+Quats + scales + opacities (ref.) & 23.12 & 24.35 & 25.05 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The results show that all LoRA configurations remain competitive with the
+full-rank baseline, with quality gaps generally under 0.5 dB. Restricting LoRA
+to colors only achieves the closest match to the baseline on the Sedan scene
+(25.14 vs.\ 25.16 dB) and performs consistently well across all three scenes.
+Adding rotations to the color target (colors + quats) produces nearly identical
+results to colors only, suggesting rotations carry low-rank structure that
+LoRA can capture without loss.
+
+The most notable degradation comes from including scales in the target set:
+configurations with scales drop by approximately 0.75 dB on Sedan compared to
+colors only, indicating that scale parameters benefit from full-rank updates to
+faithfully represent fine geometric detail. Interestingly, targeting only
+geometry attributes (quats + scales, with or without opacities) achieves
+competitive PSNR on Garden Spheres and Toy Car but underperforms on Sedan,
+suggesting scene-dependent sensitivity to geometry LoRA.
+
+Overall, colors only provides the most consistent and predictable behavior
+across scenes, making it the preferred target for the dynamic rank extension.
 
 %% -------------------------------------------------------
 \section{Takeaways}
