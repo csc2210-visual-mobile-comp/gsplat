@@ -123,5 +123,7 @@ compile_commands.json
 
 data
 results*
+*.csv
+*.pdf
 
 !examples/benchmarks/compression/results/

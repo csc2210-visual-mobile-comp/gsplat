@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
-import imageio
+import imageio.v2 as imageio
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -104,9 +104,11 @@ class Config:
     sh_degree_interval: int = 1000
     # OUR CHANGE: LoRA rank for SH correction
     disable_dynamic_rank: bool = False
+    warmup_step: int = 4000
     lora_rank: int = 16
     lora_max_rank: int = 32
     lora_min_rank: int = 2
+    disable_quota_analysis: bool = False
     lora_quota: Tuple[float, float, float] = (0.2, 0.6, 0.2)
     # Initial opacity of GS
     init_opa: float = 0.1
@@ -302,7 +304,8 @@ def create_splats_with_optimizers(
         # OUR CHANGE: Rank Tracker Mask
         # In dynamic mode, current_ranks and lora_grad_accum are always present.
         # In static mode, current_ranks is still useful for heatmap rendering.
-        current_ranks = torch.full((N, 1), float(lora_min_rank))
+        initial_rank = float(lora_rank) if disable_dynamic_rank else float(lora_min_rank)
+        current_ranks = torch.full((N, 1), initial_rank)
         params.append(("current_ranks", torch.nn.Parameter(current_ranks, requires_grad=False), 0.0))
         lora_grad_accum = torch.zeros((N, 1))
         params.append(("lora_grad_accum", torch.nn.Parameter(lora_grad_accum, requires_grad=False), 0.0))
@@ -453,6 +456,8 @@ class Runner:
                 eps=1e-15
             )
         ]
+
+        self.gmm_quota_calculated = False
 
         # OUR CHANGE: Per-bucket nn.Parameter tensors + Adam optimizers for lora_A (dynamic rank only).
         # Each bucket has its own compact [N_r, r] parameter and optimizer, so memory
@@ -965,7 +970,126 @@ class Runner:
         self.lora_A_bucket_indices = new_bucket_indices
         self.lora_A_buckets = new_buckets
         self.lora_A_bucket_optims = new_optims
+    
+    def _gmm_thresholds(self, score: torch.Tensor, n_iter: int = 20) -> Tuple[torch.Tensor, torch.Tensor]:
+        """1-D Gaussian Mixture Model with 3 components fitted via EM."""
+        s = score.float().squeeze()  # [N]
+        N = s.shape[0]
 
+        # Initialise means at quartiles, shared variance, uniform weights
+        means   = torch.quantile(s, torch.tensor([0.25, 0.5, 0.75], device=s.device))
+        vars_   = torch.full((3,), s.var().clamp(min=1e-6).item(), device=s.device)
+        weights = torch.full((3,), 1.0 / 3.0, device=s.device)
+
+        for _ in range(n_iter):
+            # E-step: log-responsibilities [N, 3]
+            diff     = s.unsqueeze(1) - means.unsqueeze(0)           # [N, 3]
+            log_resp = (
+                -0.5 * diff ** 2 / vars_.unsqueeze(0)
+                - 0.5 * vars_.log().unsqueeze(0)
+                + weights.log().unsqueeze(0)
+            )
+            log_resp = log_resp - torch.logsumexp(log_resp, dim=1, keepdim=True)
+            resp     = log_resp.exp()                                  # [N, 3]
+
+            # M-step
+            Nk      = resp.sum(dim=0).clamp(min=1e-6)                 # [3]
+            means   = (resp * s.unsqueeze(1)).sum(dim=0) / Nk
+            diff    = s.unsqueeze(1) - means.unsqueeze(0)
+            vars_   = ((resp * diff ** 2).sum(dim=0) / Nk).clamp(min=1e-6)
+            weights = Nk / N
+
+        sorted_means, _ = means.sort()
+        bottom_thresh = (sorted_means[0] + sorted_means[1]) / 2.0
+        top_thresh    = (sorted_means[1] + sorted_means[2]) / 2.0
+        return top_thresh, bottom_thresh
+    
+    @torch.no_grad()
+    def _compute_gaussian_color_variance(self) -> Optional[torch.Tensor]:
+        """Project each Gaussian center into all training images and compute color variance."""
+        import cv2 as _cv2
+
+        parser = self.parser
+        means_np = self.splats["means"].detach().cpu().numpy()  
+        N = means_np.shape[0]
+
+        obs_sum  = np.zeros((N, 3), dtype=np.float64)   
+        obs_sq   = np.zeros((N, 3), dtype=np.float64)   
+        obs_cnt  = np.zeros(N, dtype=np.int32)
+
+        train_indices = np.arange(len(parser.image_names))
+        train_indices = train_indices[train_indices % parser.test_every != 0]
+
+        for parser_idx in train_indices:
+            camera_id   = parser.camera_ids[parser_idx]
+            K           = parser.Ks_dict[camera_id]           
+            c2w         = parser.camtoworlds[parser_idx]       
+            w2c         = np.linalg.inv(c2w)
+            R, t        = w2c[:3, :3], w2c[:3, 3]
+
+            pts_cam = (R @ means_np.T + t[:, None]).T  
+            in_front = pts_cam[:, 2] > 0
+            proj = (K @ pts_cam.T).T                   
+            uv = proj[:, :2] / np.maximum(proj[:, 2:3], 1e-8)  
+            uv = np.nan_to_num(uv, nan=-1000.0, posinf=-1000.0, neginf=-1000.0)
+            uv = np.clip(uv, -10000.0, 10000.0)
+
+            image = imageio.imread(parser.image_paths[parser_idx])[..., :3].astype(np.float32)
+            if len(parser.params_dict.get(camera_id, [])) > 0 and camera_id in parser.mapx_dict:
+                image = _cv2.remap(image, parser.mapx_dict[camera_id],
+                                   parser.mapy_dict[camera_id], _cv2.INTER_LINEAR)
+                x0, y0, w, h = parser.roi_undist_dict[camera_id]
+                image = image[y0:y0 + h, x0:x0 + w]
+
+            H, W = image.shape[:2]
+            xi = np.round(uv[:, 0]).astype(np.int32)
+            yi = np.round(uv[:, 1]).astype(np.int32)
+            in_bounds = (xi >= 0) & (xi < W) & (yi >= 0) & (yi < H)
+            valid = in_front & in_bounds
+
+            xi_v, yi_v = xi[valid], yi[valid]
+            rgb = image[yi_v, xi_v]  
+
+            idx = np.where(valid)[0]
+            obs_sum[idx]  += rgb
+            obs_sq[idx]   += rgb ** 2
+            obs_cnt[idx]  += 1
+
+        enough = obs_cnt >= 3
+        variance = np.zeros(N, dtype=np.float32)
+        cnt = obs_cnt[enough].reshape(-1, 1).astype(np.float64)
+        mean_sq  = obs_sq[enough]  / cnt
+        sq_mean  = (obs_sum[enough] / cnt) ** 2
+        variance[enough] = (mean_sq - sq_mean).mean(axis=1).astype(np.float32)
+
+        return torch.from_numpy(variance).unsqueeze(-1).to(self.device)
+    
+    @torch.no_grad()
+    def _compute_quota_from_color_variance(self) -> Tuple[float, float, float]:
+        """Calculates variance, finds GMM clusters, and returns the (high, mid, low) quota."""
+
+        variances = self._compute_gaussian_color_variance()
+        
+        if variances is None:
+            print("[Warning] Not enough images for color variance. Falling back to default quota.")
+            return self.cfg.lora_quota
+
+        # Use GMM instead of K-Means to find the natural boundaries
+        top_thresh, bottom_thresh = self._gmm_thresholds(variances, n_iter=20)
+
+        var_sq = variances.squeeze()
+        high_mask = var_sq >= top_thresh
+        low_mask = var_sq <= bottom_thresh
+        mid_mask = ~(high_mask | low_mask)
+
+        N = var_sq.shape[0]
+        high_frac = float(high_mask.sum().item() / N)
+        mid_frac = float(mid_mask.sum().item() / N)
+        low_frac = float(low_mask.sum().item() / N)
+
+        print(f"[Warmup] GMM Quota Assigned: High={high_frac:.2f}, Mid={mid_frac:.2f}, Low={low_frac:.2f}\n")
+        return (high_frac, mid_frac, low_frac)
+    
     def train(self):
         cfg = self.cfg
         device = self.device
@@ -1157,7 +1281,7 @@ class Runner:
             loss.backward()
 
             # OUR CHANGE: Quantized Dynamic LoRA Rank Adjustment — accumulate per-bucket gradients
-            if not cfg.disable_dynamic_rank:
+            if not cfg.disable_dynamic_rank and step >= cfg.warmup_step:
                 with torch.no_grad():
                     for r in [cfg.lora_min_rank, 8, cfg.lora_max_rank]:
                         bucket_param = self.lora_A_buckets[r]
@@ -1171,8 +1295,13 @@ class Runner:
                     freeze_step = self.cfg.strategy.refine_stop_iter
                 else:
                     freeze_step = 15000
-                # if step == 4000: # run the analysis
-                if step > 0 and step % allocation_interval == 0 and step <= freeze_step:
+                if step > cfg.warmup_step and step % allocation_interval == 0 and step <= freeze_step:
+                    if not self.gmm_quota_calculated:
+                        if not cfg.disable_quota_analysis:
+                            new_quota = self._compute_quota_from_color_variance()
+                            self.cfg.lora_quota = new_quota
+                        self.gmm_quota_calculated = True
+
                     with torch.no_grad():
                         grad_frustration = self.splats["lora_grad_accum"] / (self.splats["current_ranks"].data + 1e-8)
 
@@ -1515,7 +1644,8 @@ class Runner:
                 self.N_prev_for_densification = N_current
 
             # eval the full set
-            if step in [i - 1 for i in cfg.eval_steps]:
+            # eval the full set
+            if step in [i - 1 for i in cfg.eval_steps] or step == max_steps - 1:
                 self.eval(step)
                 self.render_traj(step)
 
