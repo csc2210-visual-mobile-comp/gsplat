@@ -347,7 +347,9 @@ modification.
 \begin{table}[h]
 \centering
 \caption{PSNR (dB) for different LoRA target configurations. \textbf{Bold}
-indicates the best LoRA result per scene.}
+indicates the best result among color-targeting configurations per scene.
+Geometry-only rows are included for reference and are not candidates for
+memory reduction in our setting.}
 \label{tab:target_selection}
 \begin{tabular}{lccc}
 \toprule
@@ -355,27 +357,36 @@ Target & Garden Spheres & Sedan & Toy Car \\
 \midrule
 Full-rank SH3 (baseline) & 23.29 & 25.16 & 25.01 \\
 \midrule
-Colors only              & \textbf{23.05} & \textbf{24.53} & \textbf{24.69} \\
-Colors + quats           & 22.90 & 24.05 & 24.46 \\
-Colors + scales          & 22.11 & 22.13 & 23.19 \\
-Colors + quats + scales  & 22.12 & 21.58 & 23.20 \\
-Quats + scales           & 22.66 & 23.06 & 23.94 \\
-Colors + opacities       & 18.86 & 15.92 & 14.69 \\
-Quats + scales + opacities & 10.36 & 14.45 & 11.06 \\
+Colors only              & 23.08 & \textbf{25.14} & 24.85 \\
+Colors + quats           & \textbf{23.10} & 25.02 & \textbf{24.87} \\
+Colors + opacities       & 22.95 & 25.05 & 24.78 \\
+Colors + scales          & 22.94 & 24.40 & 24.81 \\
+Colors + quats + scales  & 22.94 & 24.44 & 24.81 \\
+\midrule
+Quats + scales (ref.)           & 23.14 & 24.30 & 24.98 \\
+Quats + scales + opacities (ref.) & 23.12 & 24.35 & 25.05 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Restricting LoRA to the higher-order SH coefficients (colors only) yields the
-smallest quality gap relative to the full-rank baseline, with a drop of at most
-0.34 dB across the three scenes. Extending the target set to geometry attributes
---- rotations, scales, or both --- consistently reduces PSNR, indicating that
-these parameters require full-rank optimization to accurately represent scene
-geometry. Including opacities in the target set causes a severe degradation,
-with drops of up to 10 dB, suggesting that opacity is particularly sensitive to
-the rank constraint. These results confirm that the higher-order SH coefficients
-are the appropriate sole target for LoRA, as they are the highest-leverage
-attribute for memory reduction while incurring minimal quality loss.
+The results show that all LoRA configurations remain competitive with the
+full-rank baseline, with quality gaps generally under 0.5 dB. Restricting LoRA
+to colors only achieves the closest match to the baseline on the Sedan scene
+(25.14 vs.\ 25.16 dB) and performs consistently well across all three scenes.
+Adding rotations to the color target (colors + quats) produces nearly identical
+results to colors only, suggesting rotations carry low-rank structure that
+LoRA can capture without loss.
+
+The most notable degradation comes from including scales in the target set:
+configurations with scales drop by approximately 0.75 dB on Sedan compared to
+colors only, indicating that scale parameters benefit from full-rank updates to
+faithfully represent fine geometric detail. Interestingly, targeting only
+geometry attributes (quats + scales, with or without opacities) achieves
+competitive PSNR on Garden Spheres and Toy Car but underperforms on Sedan,
+suggesting scene-dependent sensitivity to geometry LoRA.
+
+Overall, colors only provides the most consistent and predictable behavior
+across scenes, making it the preferred target for the dynamic rank extension.
 
 %% -------------------------------------------------------
 \section{Takeaways}
