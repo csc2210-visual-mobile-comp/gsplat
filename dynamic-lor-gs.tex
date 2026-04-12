@@ -152,32 +152,164 @@ their estimated view-dependent complexity, we aim to eliminate standard memory
 bottlenecks without reducing the overall Gaussian count or sacrificing rendering quality.
 
 %% -------------------------------------------------------
-\section{Methodology}
-\label{sec:method}
 
-\TODO{Fill in}
-
-%% -------------------------------------------------------
-\section{Observations and Motivation}
-\label{sec:observations}
-
-\TODO{Fill in}
 
 %% -------------------------------------------------------
 \section{Ideas and Solutions}
 \label{sec:solutions}
 
-\TODO{Fill in}
+
+\subsection{Rank Assignment Criteria}
+\label{sec:rank_criteria}
+
+%% Note: we can remove this part, and this part in the results if short on space
+
+As part of exploring dynamic rank promotion and demotion
+(Section~\ref{sec:method}), we investigated which per-Gaussian
+scoring signal best reflects a Gaussian's need for higher rank.
+We evaluated three signals: gradient magnitude
+($\sum_j |\partial \mathcal{L} / \partial \theta_{ij}|$),
+opacity-weighted gradient
+($s_i^{\text{grad}} / (\alpha_i + \varepsilon)$),
+and SH energy ($\|A_i B_i\|_F^2$, the Frobenius norm of the
+learned LoRA correction), combined with three 
+thresholding methods: fixed percentile, k-means, and Gaussian
+Mixture Model (GMM) fitted via Expectation-Maximization.
+We also explored making rank assignment fully learnable, via
+direct Stochastic Gradient Descent (SGD) on per-Gaussian rank
+values and via soft per-Gaussian logits with a rank regularization
+loss; both collapsed to a single bucket and were not pursued
+further. 
+
+\subsection{Quota Estimation}
+\label{sec:quota_estimation}
+
+Once fixed percentile quotas were adopted, a practical concern remained:
+optimal quota fractions are likely scene-dependent. We investigated how
+to estimate scene-specific fractions as early as possible, before
+peak GPU memory is reached. Inspired by Papantonakis et al.~\cite{Papantonakis_2024}, 
+who use per-Gaussian color variance to identify low view-dependence primitives 
+post-training, we ask whether this signal can inform quota fractions 
+during training. We considered two signals: SH energy
+($\|A_i B_i\|_F^2$, defined in Section~\ref{sec:rank_criteria}) and color
+variance, which measures photometric consistency of each Gaussian
+across training views:
+\begin{equation}
+  s_i^{\text{color}} = \frac{1}{3}\left(
+    \mathrm{Var}(R_i) + \mathrm{Var}(G_i) + \mathrm{Var}(B_i)
+  \right)
+\end{equation}
+where each Gaussian is projected into all training images and pixel
+colors are sampled at the projected locations. We also evaluate color
+variance at step~0, using only the SfM initialization point cloud
+before any training begins.
+
+To evaluate both signals, we use full SH3 training at step 15K as
+a gold standard - the quota fractions each signal produces at
+near-convergence, treated as the target to predict. 
+Prediction quality is measured as mean absolute error against
+the gold standard at steps 0, 1100, 2100, 3100, and 6000, under
+lora2, lora32, and sh3 training variants, using GMM and k-means
+clustering to set boundaries automatically.
+
 
 %% -------------------------------------------------------
 \section{Results}
 \label{sec:results}
 
-\TODO{Fill in}
+\subsection{Scoring Criteria}
+\label{sec:results_scoring}
+
+Across all combinations of scoring signal and clustering method,
+rendering quality differences were negligible (PSNR range
+24.33--24.44\,dB, std $\sim$1.0\,dB across three scenes),
+suggesting that the choice of per-Gaussian scoring signal matters
+less than the overall quota distribution.
+
+\subsection{Quota Estimation}
+\label{sec:results_quota}
+
+Figure~\ref{fig:scene_dep} shows gold-standard quota fractions
+across seven scenes using color variance. Fractions vary
+substantially: the low-rank bucket ranges from 0.42 to 0.59,
+confirming that scene-independent fixed quotas are a poor
+approximation and motivating scene-specific estimation.
+
+% \begin{figure}[h]
+%   \centering
+%   \includegraphics[width=\linewidth]{figures/color_variance_fraction_gs.png}
+%   \caption{Gold-standard quota fractions (SH3 at step 15K,
+%            GMM, color variance) across seven scenes.}
+%   \label{fig:scene_dep}
+% \end{figure}
+
+
+% \begin{figure}[h]
+%   \centering
+%   \includegraphics[width=\linewidth]{figures/predictor_quality_gmm.png}
+%   \caption{Mean absolute error vs.\ gold standard (GMM, averaged
+%              across scenes). Color variance (blue/green) remains
+%              below SH energy (orange/red) at all steps, including
+%              step~0 before any training.}
+%   \label{fig:predictor_quality}
+% \end{figure}
+
+\begin{figure}[h]
+  \centering
+  \begin{minipage}{0.48\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/color_variance_fraction_gs.png}
+    \caption{Gold-standard quota fractions (SH3 at step 15K,
+             GMM, color variance) across seven scenes.}
+    \label{fig:scene_dep}
+  \end{minipage}\hfill
+  \begin{minipage}{0.48\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/predictor_quality_gmm.png}
+    \caption{Mean absolute error vs.\ gold standard (GMM, averaged
+             across scenes). Color variance (blue/green) remains
+             below SH energy (orange/red) at all steps, including
+             step~0 before any training}
+    \label{fig:predictor_quality}
+  \end{minipage}
+\end{figure}
+
+Figure~\ref{fig:predictor_quality} compares prediction error
+over training steps for color variance and SH energy, under
+both lora2 and lora32 warmup. Color variance, depending only
+on Gaussian geometry, is unaffected by warmup rank and consistently 
+outperforms SH energy from the start. SH energy begins with large errors 
+as the LoRA factors have not yet learned meaningful values; 
+while lora32 recovers by step 2100, lora2 remains volatile until step 6000, 
+and both remain significantly less accurate than color variance. 
+We therefore train at rank~2 until step 6000 and run a single color 
+variance pass to set scene-specific quotas: this keeps memory low through the densification phase
+while providing a reliable quota estimate before peak memory
+is reached. 
 
 %% -------------------------------------------------------
-\section{Takeaways}
-\label{sec:takeaways}
+\section{Discussion}
+\label{sec:discussion}
+
+Mallick et al.~\cite{taming3dgs} addresses peak training VRAM by replacing 
+unconstrained densification with a budget-constrained constructive process. 
+While it demonstrates graceful quality degradation as Gaussian counts ($N$) 
+shrink, it primarily targets geometric redundancy. Our work, conversely, 
+targets representation redundancy within the Spherical Harmonic (SH) 
+coefficients. These two strategies are fundamentally orthogonal: high 
+spatial frequency, requiring more primitives, does not always overlap with 
+high view-dependency, which necessitates higher SH ranks. 
+
+As Papantonakis et al.~\cite{Papantonakis_2024} identify primitive count 
+and SH storage as the two dominant memory bottlenecks in 3DGS, a hybrid 
+approach is highly promising. Combining the budget-constrained 
+densification of Mallick et al. with our dynamic LoRA rank assignment 
+would allow for a dual-budget optimization framework. Such a system could 
+allocate resources with extreme precision, spending the ``Gaussian budget'' 
+on geometric detail and the ``Rank budget'' on complex view-dependent 
+effects, likely achieving a more favorable Pareto frontier than either 
+method in isolation.
+
 
 \TODO{Fill in}
 
