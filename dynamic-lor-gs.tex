@@ -313,7 +313,9 @@ is partitioned accordingly, so the low-rank update decomposes as:
 \end{align}
 jointly updating colors and rotations through a single per-Gaussian latent
 matrix $A$. All remaining attributes of $G$ (positions, opacity, scale) fall
-outside $\mathcal{T}$ and are optimized directly.
+outside $\mathcal{T}$ and are optimized directly. Because the frozen base
+columns of $G_{\mathcal{T}}$ lack gradients, no Adam optimizer states are
+allocated for them.
 
 \subsubsection{LoRA-Aware Densification and Computation}
 Standard densification must be wrapped with LoRA-aware bookkeeping: cloning or 
