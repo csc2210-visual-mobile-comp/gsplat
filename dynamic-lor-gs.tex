@@ -71,6 +71,38 @@ effective parameter budget, demonstrating the advantage of scene-aware
 parameter distribution for 3DGS compression.
 \end{abstract}
 
+\begin{CCSXML}
+<ccs2012>
+  <concept>
+    <concept_id>10010147.10010371.10010372</concept_id>
+    <concept_desc>Computing methodologies~Rendering</concept_desc>
+    <concept_significance>500</concept_significance>
+  </concept>
+  <concept>
+    <concept_id>10010147.10010371.10010396</concept_id>
+    <concept_desc>Computing methodologies~Image-based rendering</concept_desc>
+    <concept_significance>500</concept_significance>
+  </concept>
+  <concept>
+    <concept_id>10010147.10010257.10010258.10010259</concept_id>
+    <concept_desc>Computing methodologies~Supervised learning by regression</concept_desc>
+    <concept_significance>300</concept_significance>
+  </concept>
+  <concept>
+    <concept_id>10010583.10010588.10010591</concept_id>
+    <concept_desc>Hardware~GPU memory</concept_desc>
+    <concept_significance>300</concept_significance>
+  </concept>
+</ccs2012>
+\end{CCSXML}
+
+\ccsdesc[500]{Computing methodologies~Rendering}
+\ccsdesc[500]{Computing methodologies~Image-based rendering}
+\ccsdesc[300]{Computing methodologies~Supervised learning by regression}
+\ccsdesc[300]{Hardware~GPU memory}
+
+\keywords{3D Gaussian Splatting, Low-Rank Adaptation, novel view synthesis,
+memory-efficient training, spherical harmonics}
 
 \maketitle
 %% -------------------------------------------------------
@@ -164,7 +196,7 @@ Low-Rank Adaptation (LoRA)~\cite{lora} replaces a parameter matrix
 $W \in \mathbb{R}^{m \times n}$ with a low-rank factorization $W \approx AB$ 
 (where $A \in \mathbb{R}^{m \times r}$, $B \in \mathbb{R}^{r \times n}$, and 
 $r \ll \min(m, n)$), reducing the number of trainable parameters without 
-materializing the full matrix. The SH tensor $C \in \mathbb{R}^{3 \times 16}$ 
+materializing the full matrix. The SH tensor $C \in \mathbb{R}^{N \times 48}$
 is a natural target: methods like Reduced3DGS~\cite{Papantonakis_2024} 
 successfully prune high-degree bands with minimal quality loss, suggesting the 
 effective rank of $C$ is inherently low for most primitives. Inspired by 
@@ -202,7 +234,7 @@ Driven by the heterogeneity of real-world scenes, our core objective is to
 decouple a scene's geometric resolution from its view-dependent memory 
 footprint. We aim to design a dynamic, memory-aware routing architecture that 
 autonomously distributes parameter capacity based on localized topological 
-needs in the form of quantized low-rank buckets. By continuously evaluating 
+needs in the form of quantized low-rank bins. By continuously evaluating 
 the demand of each primitive and actively readjusting its LoRA rank 
 \emph{during} the densification phase, this project seeks to demonstrate that 
 adaptively allocating memory strictly to the regions that mathematically 
@@ -228,7 +260,7 @@ high-frequency perceptual quality of the rendered scene.
 % geometric resolution from its view-dependent memory footprint. We aim to 
 % design a dynamic, memory-aware routing architecture that autonomously 
 % distributes parameter capacity based on localized topological needs in the form 
-% of quantized low-rank buckets. By continuously evaluating the demand of each 
+% of quantized low-rank bins. By continuously evaluating the demand of each 
 % primitive and actively readjusting its LoRA rank \emph{during} the 
 % densification phase, this project seeks to demonstrate that adaptively 
 % allocating memory strictly to the regions that mathematically require it can 
@@ -239,81 +271,91 @@ high-frequency perceptual quality of the rendered scene.
 \section{Ideas and Methodologies}
 \label{sec:method}
 
-Our system operates as follows. Higher-order SH coefficients (bands 1-3) 
-for all Gaussians are factorized via LoRA into per-Gaussian latent vectors 
-and a shared projection matrix, replacing the full SH tensor and directly 
-reducing peak VRAM. During densification, each Gaussian is routed into one 
-of three rank bins $r \in \{2, 8, 32\}$ based on accumulated gradient 
-activity. Bin fractions are scene-specific, estimated from a single color 
-variance pass at step 4000 using the current Gaussian positions and training 
-camera poses. Zero-order SH coefficients and all geometry parameters remain 
-full-rank throughout.
-
 \subsection{Isolating the Memory Bottleneck}
-For a scene with $N$ Gaussian primitives, consider a target parameter block
-(e.g., the higher-order spherical harmonic coefficients) whose per-Gaussian
-contribution has dimension $D$. Instead of optimizing an unconstrained $[N 
-\times D]$ parameter matrix, we decompose the \emph{adjustment} to a frozen 
-base using Low-Rank Adaptation (LoRA)~\cite{lora} as:
+Our initial idea was to apply LoRA to any subset of Gaussian attributes ---
+colors, rotations, scales, or opacities --- to directly reduce the parameter
+budget during training, while leaving all remaining attributes full-rank.
+Let $G \in \mathbb{R}^{N \times D}$ denote the full attribute matrix, where
+each row $g^{(i)} \in \mathbb{R}^{D}$ is the attribute vector of Gaussian $i$
+and $D$ is the total per-Gaussian parameter dimension, encompassing attributes
+such as position, color (SH coefficients), opacity, rotation, and scale. Given
+a choice of target attributes $\mathcal{T} \subseteq \{\text{position, color,
+opacity, quat, scale}\}$, let
+$G_{\mathcal{T}} \in \mathbb{R}^{N \times D_{\mathcal{T}}}$ be the
+corresponding column sub-block of $G$, where $D_{\mathcal{T}} \leq D$ is the
+dimension of the targeted subset. Instead of optimizing $G_{\mathcal{T}}$
+directly, we compute a low-rank update:
 \begin{align}
-  \Delta = A B, \quad A \in \mathbb{R}^{N \times r},\; B \in 
-  \mathbb{R}^{r \times D},
+  \Delta G_{\mathcal{T}} = A B, \quad A \in \mathbb{R}^{N \times r},\; B \in
+  \mathbb{R}^{r \times D_{\mathcal{T}}},
 \end{align}
-  
-where $r \ll D$ is the rank. $A$ is a per-Gaussian matrix, and $B$ is a 
-\emph{shared} global projection matrix. The effective parameter used during 
-rasterization is:
-\begin{align}
-  \theta_{\text{eff}} = \theta_{\text{base}} + \Delta,
-\end{align}
-where $\theta_{\text{base}}$ is frozen after initialization. $A$ is optimized
-per-Gaussian, while $B$ is optimized globally via a separate optimizer.
 
-Alternatively, the full parameter matrix can be reconstructed directly as:
-\begin{align}
-  M = A B, \quad \theta_{\text{eff}} = A B,
-\end{align}
-provided the magnitude of $\theta_{\text{eff}}$ is sufficiently small.
-
-Our initial implementation applies this parameterization with a fixed rank $r$ 
-to selected Gaussian attributes. The zero-order SH coefficient (mean color) 
-remains a directly optimized parameter to preserve base color fidelity.
+where $r \ll D_{\mathcal{T}}$ is the rank. $A$ is a per-Gaussian matrix and
+$B$ is a \emph{shared} global projection matrix, both optimized jointly during
+training. All columns of $G$ outside $\mathcal{T}$ remain directly optimized
+and full-rank.
 
 \subsubsection{Flexible Target Selection}
-This architecture supports any subset of Gaussian attributes as LoRA targets. 
-For example, jointly targeting colors (SH3, $D_c = 48$), scales ($D_s = 3$), 
-and rotations ($D_q = 4$) yields a combined dimension $D = 55$. The shared 
-matrix $B \in \mathbb{R}^{r \times 55}$ is partitioned column-wise as 
-$B = [B_c \mid B_s \mid B_q]$. For Gaussian $i$ with latent vector 
-$a_i \in \mathbb{R}^{r}$, the effective attributes are:
+Because the framework above is attribute-agnostic, we initially explored
+applying LoRA to various combinations of Gaussian attributes to determine which
+offer the most effective compression target. For example, with
+$\mathcal{T} = \{\text{color, quat}\}$, the targeted sub-block is formed by
+concatenating the corresponding columns of $G$:
 \begin{align}
-  \theta^{(i)}_{\text{color}} &= \theta^{(i)}_{\text{color, base}} + a_i B_c, \\
-  \theta^{(i)}_{\text{scale}} &= \theta^{(i)}_{\text{scale, base}} + a_i B_s, \\
-  \theta^{(i)}_{\text{quat}}  &= \theta^{(i)}_{\text{quat, base}}  + a_i B_q.
+  G_{\mathcal{T}} = [G_c \mid G_{\text{quat}}] \in \mathbb{R}^{N \times D_{\mathcal{T}}},
 \end{align}
-A single latent vector $a_i$ modulates all targeted attributes. We implement 
-these updates as residuals to accommodate rotation and scale adjustments. 
-Because frozen base tensors lack gradients, no Adam optimizer states are 
-allocated for them.
+where $G_c \in \mathbb{R}^{N \times D_c}$ ($D_c = 48$) and
+$G_{\text{quat}} \in \mathbb{R}^{N \times D_{\text{quat}}}$ ($D_{\text{quat}} = 4$) give $D_{\mathcal{T}} = 52$.
+The shared projection $B = [B_c \mid B_{\text{quat}}] \in \mathbb{R}^{r \times D_{\mathcal{T}}}$
+is partitioned accordingly, so the low-rank update decomposes as:
+\begin{align}
+  \Delta G_{\mathcal{T}} = AB = [AB_c \mid AB_{\text{quat}}],
+\end{align}
+jointly updating colors and rotations through a single per-Gaussian latent
+matrix $A$. All remaining attributes of $G$ (positions, opacity, scale) fall
+outside $\mathcal{T}$ and are optimized directly.
 
 \subsubsection{LoRA-Aware Densification and Computation}
 Standard densification must be wrapped with LoRA-aware bookkeeping: cloning or 
 splitting a Gaussian duplicates its corresponding row in $A$, while pruning 
-removes it. During training, $\theta_{\text{eff}}$ is computed dynamically and 
-passed to the rasterizer, ensuring regularization losses correctly penalize the 
-effective parameters influencing the render.
+removes it. During training, $G_{\mathcal{T},\text{base}} + \Delta G_{\mathcal{T}}$ is
+computed dynamically and passed to the rasterizer, ensuring regularization
+losses correctly penalize the effective parameters influencing the render.
 
 \subsubsection{Settling on Higher-Order SH}
-Ablation studies revealed that applying LoRA to geometry (positions, scales, 
-rotations) degrades reconstruction quality, as these require precise, high-rank 
-updates to represent sharp structural boundaries. Therefore, we restrict LoRA 
-to higher-order SH bands (1--3). Because this tensor dominates the per-Gaussian 
-parameter budget, it is simultaneously the most effective target for memory 
-reduction (see Table~\ref{tab:target_selection})..
+Ablation studies revealed that applying LoRA to geometry (positions, scales,
+rotations) degrades reconstruction quality, as these require precise, high-rank
+updates to represent sharp structural boundaries. Therefore, we restrict LoRA
+to higher-order SH bands (1--3), approximating only the color matrix
+$G_c \in \mathbb{R}^{N \times D_c}$ with a single fixed rank $r$ uniformly
+across all Gaussians: $G_c = AB$, $A \in \mathbb{R}^{N \times r}$,
+$B \in \mathbb{R}^{r \times D_c}$. Because this tensor dominates the
+per-Gaussian parameter budget, it is simultaneously the most effective target
+for memory reduction (see Table~\ref{tab:target_selection}). We refer to this
+uniform-rank baseline as \textbf{Static LoRA}.
 
 \subsection{Dynamic Resource Allocation}
-% We iteratively designed and evaluated several dynamic allocation strategies to 
+% We iteratively designed and evaluated several dynamic allocation strategies to
 % distribute capacity based on estimated primitive complexity.
+
+We partition the $N$ Gaussians into $B = 3$ bins with rank
+assignments $r_b \in \{2, 8, 32\}$, where bin $b$ contains $N_b$ Gaussians
+with $\sum_{b=1}^{B} N_b = N$. The LoRA target is the higher-order SH color coefficients (bands 1--3); the
+zero-order SH and all geometry parameters remain full-rank throughout. Let
+$G_{c,b} \in \mathbb{R}^{N_b \times D_c}$ be the color sub-matrix restricted
+to bin $b$, where $D_c$ is the dimension of the bands 1--3 coefficients. It is
+reconstructed directly via a bin-specific low-rank factorization:
+\begin{align}
+  G_{c,b} = A_b B_b, \quad A_b \in \mathbb{R}^{N_b \times r_b},\;
+  B_b \in \mathbb{R}^{r_b \times D_c},
+\end{align}
+where $r_b$ controls the representational capacity of bin $b$, keeping the
+per-bin memory footprint strictly equal to $N_b r_b + r_b D_c$. Bin fractions
+$(N_b / N)$ are scene-specific, estimated from a single color variance pass at
+step 4000 using the current Gaussian positions and training camera poses.
+Assigning different ranks $r_b$ to different bins allows different subsets of
+Gaussians to use different levels of expressiveness, decoupling per-primitive
+capacity from the global parameter budget.
 
 \subsubsection{Global Masking as a Proof of Concept}
 To validate the rasterizer's ability to handle heterogeneous capacities, we 
@@ -325,69 +367,62 @@ underlying dense allocation, this confirmed that heterogeneous rank
 representations maintain training stability, justifying the development of a 
 genuinely sparse architecture.
 
-\subsubsection{Scoring Signals and Limitations of Absolute Thresholds}
-Our initial active migration strategy employed absolute scalar thresholds to 
-promote or demote ranks based on these scores. Empirical testing demonstrated 
-this approach is brittle. Baseline gradient magnitudes fluctuate significantly 
-across datasets depending on material properties (e.g., matte vs.\ 
-reflective). Attempts to use statistical bounds, such as means or median 
-multipliers, also failed. Looser bounds resulted in static allocations, while 
-tighter bounds induced frequent rank thrashing as gradients oscillated during 
-local error minimization. This establishes that absolute thresholding is 
+\subsubsection{Scoring Signals}
+We evaluated three per-Gaussian scoring signals to quantify representational
+demand. The \textbf{gradient score} accumulates the absolute gradients of the
+loss with respect to the active LoRA parameters:
+\begin{equation}
+  \gamma^{(i)} \mathrel{+}= \left\| \nabla_{a^{(i)}} \mathcal{L} \right\|_1
+\end{equation}
+A persistently high gradient indicates the current rank is insufficient to
+capture the Gaussian's view-dependent appearance. Post-epoch, this value is
+normalized by the current rank ($\tilde{\gamma}^{(i)} = \gamma^{(i)} / r^{(i)}$)
+to enable cross-bin comparison, and the buffer is reset. We also evaluated an
+\textbf{opacity-weighted gradient} ($s_i^{\text{grad}} / (\alpha_i +
+\varepsilon)$), which corrects for near-transparent Gaussians that contribute
+little to the rendered image regardless of SH complexity, and \textbf{SH
+energy} ($\|a^{(i)} B\|_F^2$), which measures the total magnitude of the
+reconstructed higher-order SH color coefficients for Gaussian $i$. We
+additionally explored fully learnable rank assignment via SGD on per-Gaussian
+rank values and via soft per-Gaussian logits with a rank regularization loss;
+both collapsed toward a single bin and were not pursued further.
+
+Across all scoring signal combinations, rendering quality differences were
+negligible (PSNR range 24.33--24.44\,dB), confirming that quota distribution
+matters more than the choice of scoring signal.
+
+\subsubsection{Absolute Thresholds}
+Our initial active migration strategy promoted or demoted ranks using absolute
+scalar thresholds on $\gamma^{(i)}$ --- for example, fixed cutoffs
+($\gamma^{(i)} > 10^{-3}$) or median-relative bounds
+($\gamma^{(i)} > k \cdot \text{median}(\gamma)$). Empirical testing
+demonstrated this approach is brittle: gradient magnitudes vary significantly
+across datasets, so loose bounds produced static allocations while tight bounds
+induced rank thrashing. This establishes that absolute thresholding is
 ill-suited for the dynamic topology of 3DGS.
 
-We therefore moved to a relative ranking approach, and evaluated three 
-per-Gaussian scoring signals as inputs. The \textbf{gradient score} 
-accumulates the absolute gradients of the loss with respect to the active 
-LoRA parameters:
-\begin{equation}
-  g^{(i)} \mathrel{+}= \left\| \nabla_{a^{(i)}} \mathcal{L} \right\|_1
-\end{equation}
-A persistently high gradient indicates the current rank is insufficient to 
-capture the Gaussian's view-dependent appearance. Post-epoch, this value is 
-normalized by the current rank ($\tilde{g}^{(i)} = g^{(i)} / r^{(i)}$) to 
-enable cross-bin comparison, and the buffer is reset. We also evaluated an 
-\textbf{opacity-weighted gradient} ($s_i^{\text{grad}} / (\alpha_i + 
-\varepsilon)$), which corrects for near-transparent Gaussians that contribute 
-little to the rendered image regardless of SH complexity, and \textbf{SH 
-energy} ($\|A_i B_i\|_F^2$), which measures the magnitude of the learned 
-LoRA correction directly. We additionally explored fully learnable rank 
-assignment via SGD on per-Gaussian rank values and via soft per-Gaussian 
-logits with a rank regularization loss; both collapsed toward a single bucket 
-and were not pursued further. 
-
-Across all scoring signal and clustering 
-combinations, rendering quality differences were negligible (PSNR range 
-24.33--24.44\,dB), confirming that quota distribution matters more than the 
-choice of scoring signal.
-
-
-
-\subsubsection{Gradient-Based Scoring and Percentile Routing}
-To map these scores ($\tilde{g}$) to VRAM constraints, we compared fixed 
-numerical quotas against percentile distributions. Theoretically, fixed quotas 
-offer the minimal memory footprint: by establishing absolute bounds, the system 
-can statically pre-allocate tensors, completely bypassing the VRAM overhead 
-associated with dynamically slicing, copying, and migrating tensor entries. 
-However, empirical implementation revealed a baseline ``materialization 
-cost''---a structural memory lower bound that both fixed and percentile routing 
-inevitably encounter. Because this shared floor negates the theoretical memory 
-advantage of static pre-allocation, we use percentile quotas 
-$(q_{\text{top}}, q_{\text{mid}}, q_{\text{bot}})$. Although this requires 
-dynamic tensor migration, percentiles scale natively with the evolving 
-geometry, guaranteeing a consistent parameter-to-topology ratio.
+\subsubsection{Percentile Routing}
+To map $\tilde{\gamma}^{(i)}$ scores to bin assignments, we first tried fixed
+numerical quotas (e.g.\ 100K Gaussians to $r=2$, 200K to $r=8$, remainder to
+$r=32$), which allow static tensor pre-allocation. However, both fixed and
+percentile routing share a ``materialization cost'' floor, negating this
+advantage. We therefore use percentile quotas $(q_{\text{top}}, q_{\text{mid}},
+q_{\text{bot}})$ --- e.g.\ $(0.4, 0.4, 0.2)$ for the high-, mid-, and
+low-rank bins respectively --- which scale natively with the evolving geometry
+as densification grows $N$. We refer to this method as \textbf{Fixed Percentile LoRA}.
 
 \subsubsection{Scene Analysis for Relative Thresholding}
-Because optimal quota fractions are scene-dependent, we require a mechanism to 
-estimate them early in training, prior to reaching peak GPU memory. GPU memory 
-grows continuously during densification, peaking at approximately step 6100 
-in standard SH3 training; any quota decision must therefore be made before 
-this point. Inspired by post-training variance analysis~\cite{Papantonakis_2024}, 
-we evaluated two predictive signals during the densification phase.
+Rather than treating $(q_{\text{top}}, q_{\text{mid}}, q_{\text{bot}})$ as
+arbitrary hyperparameters, we developed a method to estimate scene-specific
+quotas automatically early in training, prior to reaching peak GPU memory. This is necessary because GPU memory
+grows continuously during densification, peaking at approximately step 6100 in
+standard SH3 training, so any quota decision must be made before this point.
+Inspired by post-training variance analysis~\cite{Papantonakis_2024}, we
+evaluated two predictive signals during the densification phase.
 
-\textbf{SH energy} ($\|A_i B_i\|_F^2$) measures the magnitude of the learned 
-LoRA correction but depends on the learned parameters and is therefore 
-sensitive to warmup rank: under rank-2 warmup, it remains unreliable until 
+\textbf{SH energy} ($\|a^{(i)} B\|_F^2$) measures the total magnitude of the
+reconstructed higher-order SH color coefficients, but depends on the learned
+parameters and is therefore sensitive to warmup rank: under rank-2 warmup, it remains unreliable until 
 step 6000 --- past the memory peak.
 
 \textbf{Color variance} measures photometric consistency of each Gaussian 
@@ -430,10 +465,10 @@ initialization. While the rank-32 model recovers by step 2100, the rank-2
 model remains volatile until step 6000, and both remain less accurate than 
 color variance. 
 
-We therefore train at rank~2 until step 4000 and run a single color variance 
-pass to establish  scene-specific quotas, minimizing memory consumption 
-through the densification phase while providing a reliable estimate before peak 
-memory is reached.
+We therefore train at rank~2 until step 4000 and run a single color variance
+pass to establish scene-specific quotas, minimizing memory consumption
+through the densification phase while providing a reliable estimate before peak
+memory is reached. We refer to this method as \textbf{Dynamic LoRA}.
 
 %% -------------------------------------------------------
 \section{Experimental Setup}
@@ -457,15 +492,15 @@ Five model variants are compared:
   baseline (15 parameters per channel).
   \item \textbf{Static LoRA} --- uniform LoRA rank $r=16$ across all 
   Gaussians.
-  \item \textbf{Fixed LoRA} --- dynamic routing into bins $r \in \{2, 8, 32\}$ 
+  \item \textbf{Fixed Percentile LoRA} --- dynamic routing into bins $r \in \{2, 8, 32\}$ 
   with fixed scene-independent quotas: bottom 20\% $\to r=2$, middle 40\% 
   $\to r=8$, top 40\% $\to r=32$. Weighted average rank: 
   $0.2{\times}2 + 0.4{\times}8 + 0.4{\times}32 = 16.4$.
-  \item \textbf{Dynamic LoRA} --- same bins and routing as Fixed LoRA, with 
+  \item \textbf{Dynamic LoRA} --- same bins and routing as Fixed Percentile LoRA, with 
   scene-specific quotas estimated via GMM clustering on color variance at 
   step 4000.
 \end{itemize}
-To ensure a fair budget comparison, Static LoRA ($r=16$), Fixed LoRA, and 
+To ensure a fair budget comparison, Static LoRA ($r=16$), Fixed Percentile LoRA, and 
 Dynamic LoRA all operate at a weighted average rank of $r_{\text{eff}} 
 \approx 16$--$16.4$.
 
@@ -629,7 +664,7 @@ Rot. + Scales + Opac. (Ref.) & 23.12 & 24.35 & 25.05 \\
 
 % Figure~\ref{fig:scene_dep} shows gold-standard quota fractions across seven 
 % scenes using color variance. These fractions vary substantially with the 
-% low-rank bucket ranging from 0.42 to 0.59, confirming that scene-independent 
+% low-rank bin ranging from 0.42 to 0.59, confirming that scene-independent 
 % fixed quotas are ineffective and justifying scene-specific estimation.
 
 
@@ -642,7 +677,7 @@ budget (see Experimental Setup).
 By architectural definition, standard SH2 establishes the lower bound for 
 memory consumption (e.g., $4.50$\,GB on the \textit{Garden Sphere} scene). 
 Because LoRA-based methods require maintaining localized pointer arrays, 
-bucket indices, and segregated Adam optimizer states, they inherently carry a 
+bin indices, and segregated Adam optimizer states, they inherently carry a 
 VRAM overhead that prevents them from outperforming SH2 in pure memory 
 reduction at the same effective rank. 
 
@@ -699,7 +734,7 @@ estimators capable of predicting scene complexity directly from the initial
 sparse point cloud.
 
 \subsection{Implementation Overhead and Future Integration}
-Despite requiring per-bucket optimizers and periodic reallocation, our 
+Despite requiring per-bin optimizers and periodic reallocation, our 
 implementation achieves memory savings close to the theoretical limit. For the 
 \textit{Garden Sphere} scene, our average rank of 16.4 predicts a theoretical 
 saving of 1.48 GB against a measured 1.31 GB. This 0.17 GB gap (similarly 
@@ -708,7 +743,7 @@ Python-level memory management, explicitly clearing stale optimizer states
 during rank reallocation. The remaining discrepancy represents a 
 framework-level materialization cost. Specifically, temporary dense tensors 
 must be allocated during densification and forward passes to interface 
-fragmented bucket matrices with standard framework logic. To completely 
+fragmented bin matrices with standard framework logic. To completely 
 eliminate this indexing overhead and maximize hardware efficiency, 
 variable-rank memory pointers must eventually be integrated into custom 
 C++/CUDA kernels. Nevertheless, our implementation validates the architectural 
