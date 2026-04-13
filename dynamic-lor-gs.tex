@@ -17,7 +17,13 @@
 \usepackage{amsmath}
 \usepackage{microtype}
 \usepackage{xcolor}
+\usepackage{titlesec}
+\usepackage{enumitem}
 
+\raggedbottom
+\titlespacing*{\section}{0pt}{1.2ex plus 1ex minus .2ex}{0.8ex plus .2ex}
+\titlespacing*{\subsection}{0pt}{1.0ex plus 1ex minus .2ex}{0.5ex plus .2ex}
+\setlength{\textfloatsep}{10pt plus 1.0pt minus 2.0pt}
 
 \newcommand{\TODO}[1]{\textcolor{red}{\textbf{[#1]}}}
 
@@ -83,32 +89,27 @@ majority of this parameter budget is consumed by the higher-order Spherical
 Harmonic (SH) coefficients, which are necessary to model complex, 
 view-dependent color phenomena such as reflections and specular highlights. 
 
-To mitigate this bottleneck, recent works propose various compression 
-strategies, ranging from geometric pruning~\cite{minisplatting, lp3dgs} to 
-reducing the maximum allowed SH degree across the scene~\cite{Papantonakis_2024, 
-lfgs, sgsplatting, megs2}. Alternatively, applying standard Low-Rank 
-Adaptation (LoRA)~\cite{lora} to the SH parameters can compress the footprint. 
-However, these static approaches share a fundamental limitation: they assume 
-the scene's view-dependent complexity is uniform. In physical reality, scenes 
-are highly heterogeneous. A matte wall requires minimal view-dependent 
-capacity, whereas a glossy car window requires precise, high-frequency 
-parameterization. Imposing a uniform parameter constraint forces the 
-over-parameterization of diffuse surfaces while limiting the capacity available 
-to render complex specularities accurately.
+Existing mitigation strategies either operate post-training --- leaving peak 
+VRAM unaffected --- or apply uniform constraints that fail to account for the 
+physical heterogeneity of real-world scenes. 
+A matte wall requires minimal view-dependent capacity, 
+whereas a glossy car window requires precise, high-frequency parameterization. 
+Imposing a uniform parameter constraint forces the over-parameterization of 
+diffuse surfaces while limiting the capacity available to render complex specularities accurately.
 
 In this work, we address the limitations of uniform parameter allocation. We 
 propose a Dynamic LoRA architecture that profiles and distributes 
 representational capacity based on the localized demands of the scene. By 
 factorizing the higher-order SH coefficients into a shared projection matrix 
-and per-Gaussian low-rank latents, we create a flexible parameter space. During 
-the geometric densification phase, we track the gradient activity of each 
+and per-Gaussian low-rank latents, we create a flexible parameter space. 
+During the geometric densification phase, we track the gradient activity of each 
 primitive to quantify its demand for high-frequency details. Using a 
 percentile-based routing mechanism to avoid spatial starvation, our system 
 dynamically migrates Gaussians between discrete rank bins. This ensures that 
 memory is allocated where the physical topology of the scene demands it.
 
 In summary, our main contributions are:
-\begin{itemize}
+\begin{itemize}[noitemsep, topsep=0pt]
     \item We introduce a Dynamic LoRA architecture for 3DGS that 
     factorizes higher-order SH coefficients to enable heterogeneous, 
     per-primitive capacity allocation.
@@ -122,53 +123,73 @@ In summary, our main contributions are:
 \end{itemize}
 
 %% -------------------------------------------------------
-\section{Background and Related Work}
+\section{Background}
 \label{sec:background}
 3D Gaussian Splatting (3DGS)~\cite{kerbl2023} is a leading framework for novel 
 view synthesis. By representing scenes with explicit, differentiable 3D 
 Gaussian primitives rendered via fast tile-based rasterization, 3DGS achieves 
 high-fidelity real-time rendering and fast training. This efficiency has 
 motivated extensive follow-on work in dynamic scenes~\cite{lr4dgstream}, 
-editing~\cite{gaussianeditor}, 
-compression~\cite{Papantonakis_2024, survey3dgs}, and avatar 
+editing~\cite{gaussianeditor}, compression~\cite{Papantonakis_2024, survey3dgs}, and avatar 
 generation~\cite{avatar}.
 
 Despite this success, optimizing 3DGS on memory-constrained hardware remains 
 challenging due to two coupled factors. First, adaptive densification 
 continuously clones and splits primitives, expanding the population $N$ to 
 several million. Second, each Gaussian requires a substantial parameter budget. 
-Because view-dependent color is modeled by degree-3 spherical harmonic (SH3) 
-coefficients, each primitive stores 48 floating-point values just for color. 
-These coefficients dominate the memory footprint, consuming roughly 576\,MB for 
-a 3-million Gaussian scene before accounting for optimizer states and 
-gradients~\cite{Papantonakis_2024, survey3dgs}. Consequently, peak training 
-VRAM is a critical bottleneck that existing methods struggle to fully resolve.
+Because appearance is view-dependent, a simple RGB representation, using only 
+three floating-point values per point, is insufficient, as it assumes color is 
+constant across all viewing directions. In practice, effects such as reflections 
+and specular highlights cause color to vary with viewpoint. To capture this, color 
+is modeled using degree-3 spherical harmonic (SH3) coefficients, which provide a 
+compact mathematical representation of direction-dependent color over the viewing sphere. 
+As a result, each primitive stores 48 floating-point values just for color. 
+These coefficients dominate the memory footprint, consuming roughly 576 MB for a 
+3-million Gaussian scene before accounting for optimizer states and gradients~\cite{Papantonakis_2024, survey3dgs}.
+Consequently, peak training VRAM is a critical bottleneck that existing methods struggle to fully resolve.
+
+%% -------------------------------------------------------
+
+\section{Related Work}
+\label{sec:related}
 
 Current memory-reduction strategies generally fall into two categories: 
 pruning and post-training compression. Pruning methods such as 
 Mini-Splatting~\cite{minisplatting} and LP-3DGS~\cite{lp3dgs} reduce $N$ 
 directly, which can degrade fine geometric detail. Alternatively, compression 
 techniques like Reduced3DGS~\cite{Papantonakis_2024}, LFGS~\cite{lfgs}, 
-SG-Splatting~\cite{sgsplatting}, and MEGS2~\cite{megs2} reduce the per-Gaussian 
+SG-Splatting~\cite{sgsplatting}, and MEGS\textsuperscript{2}~\cite{megs2} reduce the per-Gaussian 
 footprint through SH band masking or lobe replacement. Because these operations 
 occur \emph{after} training completes, the full SH tensor must be maintained 
 throughout optimization, leaving peak training memory unaffected.
 
-We propose reducing the per-Gaussian parameter cost adaptively \emph{during} 
-training using Low-Rank Adaptation (LoRA)~\cite{lora}. LoRA replaces a 
-parameter matrix $W \in \mathbb{R}^{m \times n}$ with a low-rank factorization 
-$W \approx AB$ (where $A \in \mathbb{R}^{m \times r}$, 
-$B \in \mathbb{R}^{r \times n}$, and $r \ll \min(m, n)$). Maintaining only 
-these low-rank factors directly reduces peak VRAM allocation.
+Low-Rank Adaptation (LoRA)~\cite{lora} replaces a parameter matrix 
+$W \in \mathbb{R}^{m \times n}$ with a low-rank factorization $W \approx AB$ 
+(where $A \in \mathbb{R}^{m \times r}$, $B \in \mathbb{R}^{r \times n}$, and 
+$r \ll \min(m, n)$), reducing the number of trainable parameters without 
+materializing the full matrix. The SH tensor $C \in \mathbb{R}^{3 \times 16}$ 
+is a natural target: methods like Reduced3DGS~\cite{Papantonakis_2024} 
+successfully prune high-degree bands with minimal quality loss, suggesting the 
+effective rank of $C$ is inherently low for most primitives. Inspired by 
+adaptive budget allocation in language models~\cite{adalora}, distributing 
+this rank heterogeneously, rather than applying a uniform constraint, 
+could reduce peak VRAM while preserving perceptual fidelity.
 
-The SH tensor $C \in \mathbb{R}^{3 \times 16}$ is the primary target for this 
-factorization. Because methods like Reduced3DGS~\cite{Papantonakis_2024} 
-successfully prune high-degree bands with minimal quality loss, we hypothesize 
-the effective rank of $C$ is inherently low for most primitives. Inspired by 
-adaptive budget allocation in language models~\cite{adalora}, we dynamically 
-distribute this rank rather than applying a uniform constraint. This approach 
-leverages the fact that matte surfaces require less representational capacity 
-than complex specularities.
+% We propose reducing the per-Gaussian parameter cost adaptively \emph{during} 
+% training using Low-Rank Adaptation (LoRA)~\cite{lora}. LoRA replaces a 
+% parameter matrix $W \in \mathbb{R}^{m \times n}$ with a low-rank factorization 
+% $W \approx AB$ (where $A \in \mathbb{R}^{m \times r}$, 
+% $B \in \mathbb{R}^{r \times n}$, and $r \ll \min(m, n)$). Maintaining only 
+% these low-rank factors directly reduces peak VRAM allocation.
+
+% The SH tensor $C \in \mathbb{R}^{3 \times 16}$ is the primary target for this 
+% factorization. Because methods like Reduced3DGS~\cite{Papantonakis_2024} 
+% successfully prune high-degree bands with minimal quality loss, we hypothesize 
+% the effective rank of $C$ is inherently low for most primitives. Inspired by 
+% adaptive budget allocation in language models~\cite{adalora}, we dynamically 
+% distribute this rank rather than applying a uniform constraint. This approach 
+% leverages the fact that matte surfaces require less representational capacity 
+% than complex specularities.
 
 While LoRA has been introduced to the 3DGS ecosystem, it is typically applied 
 to auxiliary neural network weights for dynamic streaming~\cite{lr4dgstream} or 
@@ -178,37 +199,59 @@ our knowledge, this is the first work to apply low-rank factorization directly
 to 3DGS primitive parameters during optimization to reduce peak training memory.
 
 %% -------------------------------------------------------
-\section{Motivations and Objectives}
-\label{sec:motivations}
-While the peak training VRAM bottleneck of 
-3DGS~\cite{kerbl2023, Papantonakis_2024, survey3dgs} is well-documented, 
-current mitigation strategies rely on uniform constraints that fail to account 
-for the physical heterogeneity of real-world environments. Our primary 
-motivation is grounded in the observation that view-dependent complexity 
-varies significantly across a scene. A diffuse surface, such as a painted wall, 
-exhibits minimal color variation across viewing angles and warrants only a few 
-coefficients. Conversely, highly specular objects, such as a glossy car 
-chassis, require precise, high-frequency parameterization spanning the full SH 
-band. Assigning a uniform parameter budget to every Gaussian primitive is 
-therefore structurally inefficient. Furthermore, while applying a static LoRA 
-uniformly across the scene reduces total memory, it limits the capacity 
-available for high-frequency details while over-parameterizing simple geometry,
-forcing an unnecessary compromise between VRAM savings and perceptual fidelity.
+\section{Goal}
+\label{sec:goal}
+Driven by the heterogeneity of real-world scenes, our core objective is to 
+decouple a scene's geometric resolution from its view-dependent memory 
+footprint. We aim to design a dynamic, memory-aware routing architecture that 
+autonomously distributes parameter capacity based on localized topological 
+needs in the form of quantized low-rank buckets. By continuously evaluating 
+the demand of each primitive and actively readjusting its LoRA rank 
+\emph{during} the densification phase, this project seeks to demonstrate that 
+adaptively allocating memory strictly to the regions that mathematically 
+require it can significantly reduce peak training VRAM while preserving the 
+high-frequency perceptual quality of the rendered scene.
 
-Driven by these observations, our core objective is to decouple a scene's 
-geometric resolution from its view-dependent memory footprint. We aim to 
-design a dynamic, memory-aware routing architecture that autonomously 
-distributes parameter capacity based on localized topological needs in the form 
-of quantized low-rank buckets. By continuously evaluating the demand of each 
-primitive and actively readjusting its LoRA rank \emph{during} the 
-densification phase, this project seeks to demonstrate that adaptively 
-allocating memory strictly to the regions that mathematically require it can 
-significantly reduce peak training VRAM while preserving the high-frequency 
-perceptual quality of the rendered scene.
+% While the peak training VRAM bottleneck of 
+% 3DGS~\cite{kerbl2023, Papantonakis_2024, survey3dgs} is well-documented, 
+% current mitigation strategies rely on uniform constraints that fail to account 
+% for the physical heterogeneity of real-world environments. Our primary 
+% motivation is grounded in the observation that view-dependent complexity 
+% varies significantly across a scene. A diffuse surface, such as a painted wall, 
+% exhibits minimal color variation across viewing angles and warrants only a few 
+% coefficients. Conversely, highly specular objects, such as a glossy car 
+% chassis, require precise, high-frequency parameterization spanning the full SH 
+% band. Assigning a uniform parameter budget to every Gaussian primitive is 
+% therefore structurally inefficient. Furthermore, while applying a static LoRA 
+% uniformly across the scene reduces total memory, it limits the capacity 
+% available for high-frequency details while over-parameterizing simple geometry,
+% forcing an unnecessary compromise between VRAM savings and perceptual fidelity.
+
+% Driven by these observations, our core objective is to decouple a scene's 
+% geometric resolution from its view-dependent memory footprint. We aim to 
+% design a dynamic, memory-aware routing architecture that autonomously 
+% distributes parameter capacity based on localized topological needs in the form 
+% of quantized low-rank buckets. By continuously evaluating the demand of each 
+% primitive and actively readjusting its LoRA rank \emph{during} the 
+% densification phase, this project seeks to demonstrate that adaptively 
+% allocating memory strictly to the regions that mathematically require it can 
+% significantly reduce peak training VRAM while preserving the high-frequency 
+% perceptual quality of the rendered scene.
 
 %% -------------------------------------------------------
 \section{Ideas and Methodologies}
 \label{sec:method}
+
+Our system operates as follows. Higher-order SH coefficients (bands 1-3) 
+for all Gaussians are factorized via LoRA into per-Gaussian latent vectors 
+and a shared projection matrix, replacing the full SH tensor and directly 
+reducing peak VRAM. During densification, each Gaussian is routed into one 
+of three rank bins $r \in \{2, 8, 32\}$ based on accumulated gradient 
+activity. Bin fractions are scene-specific, estimated from a single color 
+variance pass at step 4000 using the current Gaussian positions and training 
+camera poses. Zero-order SH coefficients and all geometry parameters remain 
+full-rank throughout.
+
 \subsection{Isolating the Memory Bottleneck}
 For a scene with $N$ Gaussian primitives, consider a target parameter block
 (e.g., the higher-order spherical harmonic coefficients) whose per-Gaussian
@@ -269,11 +312,11 @@ rotations) degrades reconstruction quality, as these require precise, high-rank
 updates to represent sharp structural boundaries. Therefore, we restrict LoRA 
 to higher-order SH bands (1--3). Because this tensor dominates the per-Gaussian 
 parameter budget, it is simultaneously the most effective target for memory 
-reduction.
+reduction (see Table~\ref{tab:target_selection})..
 
 \subsection{Dynamic Resource Allocation}
-We iteratively designed and evaluated several dynamic allocation strategies to 
-distribute capacity based on estimated primitive complexity.
+% We iteratively designed and evaluated several dynamic allocation strategies to 
+% distribute capacity based on estimated primitive complexity.
 
 \subsubsection{Global Masking as a Proof of Concept}
 To validate the rasterizer's ability to handle heterogeneous capacities, we 
@@ -285,28 +328,45 @@ underlying dense allocation, this confirmed that heterogeneous rank
 representations maintain training stability, justifying the development of a 
 genuinely sparse architecture.
 
-\subsubsection{Limitations of Absolute Scalar Thresholds}
+\subsubsection{Scoring Signals and Limitations of Absolute Thresholds}
 Our initial active migration strategy employed absolute scalar thresholds to 
-promote or demote ranks based on gradient magnitudes. Empirical testing 
-demonstrated this approach is brittle. Baseline gradient magnitudes fluctuate 
-significantly across datasets depending on material properties (e.g., matte vs. 
+promote or demote ranks based on these scores. Empirical testing demonstrated 
+this approach is brittle. Baseline gradient magnitudes fluctuate significantly 
+across datasets depending on material properties (e.g., matte vs.\ 
 reflective). Attempts to use statistical bounds, such as means or median 
 multipliers, also failed. Looser bounds resulted in static allocations, while 
 tighter bounds induced frequent rank thrashing as gradients oscillated during 
 local error minimization. This establishes that absolute thresholding is 
 ill-suited for the dynamic topology of 3DGS.
 
-\subsubsection{Gradient-Based Scoring and Percentile Routing}
-To quantify representational demand, we track gradient activity. For Gaussian 
-$i$ assigned to rank $r^{(i)}$, we accumulate the absolute gradients of its 
-latent vector $a^{(i)}$ after each backward pass:
+We therefore moved to a relative ranking approach, and evaluated three 
+per-Gaussian scoring signals as inputs. The \textbf{gradient score} 
+accumulates the absolute gradients of the loss with respect to the active 
+LoRA parameters:
 \begin{equation}
   g^{(i)} \mathrel{+}= \left\| \nabla_{a^{(i)}} \mathcal{L} \right\|_1
 \end{equation}
-Post-epoch, this value is normalized by the current rank 
-($\tilde{g}^{(i)} = g^{(i)} / r^{(i)}$) to enable cross-bin comparison, and 
-the buffer is reset.
+A persistently high gradient indicates the current rank is insufficient to 
+capture the Gaussian's view-dependent appearance. Post-epoch, this value is 
+normalized by the current rank ($\tilde{g}^{(i)} = g^{(i)} / r^{(i)}$) to 
+enable cross-bin comparison, and the buffer is reset. We also evaluated an 
+\textbf{opacity-weighted gradient} ($s_i^{\text{grad}} / (\alpha_i + 
+\varepsilon)$), which corrects for near-transparent Gaussians that contribute 
+little to the rendered image regardless of SH complexity, and \textbf{SH 
+energy} ($\|A_i B_i\|_F^2$), which measures the magnitude of the learned 
+LoRA correction directly. We additionally explored fully learnable rank 
+assignment via SGD on per-Gaussian rank values and via soft per-Gaussian 
+logits with a rank regularization loss; both collapsed toward a single bucket 
+and were not pursued further. 
 
+Across all scoring signal and clustering 
+combinations, rendering quality differences were negligible (PSNR range 
+24.33--24.44\,dB), confirming that quota distribution matters more than the 
+choice of scoring signal.
+
+
+
+\subsubsection{Gradient-Based Scoring and Percentile Routing}
 To map these scores ($\tilde{g}$) to VRAM constraints, we compared fixed 
 numerical quotas against percentile distributions. Theoretically, fixed quotas 
 offer the minimal memory footprint: by establishing absolute bounds, the system 
@@ -322,32 +382,99 @@ geometry, guaranteeing a consistent parameter-to-topology ratio.
 
 \subsubsection{Scene Analysis for Relative Thresholding}
 Because optimal quota fractions are scene-dependent, we require a mechanism to 
-estimate them early in training, prior to reaching peak GPU memory. Inspired by 
-post-training variance analysis~\cite{Papantonakis_2024}, we evaluated two 
-predictive signals during the densification phase: SH energy 
-($\|A_i B_i\|_F^2$) and initial color variance across training views:
+estimate them early in training, prior to reaching peak GPU memory. GPU memory 
+grows continuously during densification, peaking at approximately step 6100 
+in standard SH3 training; any quota decision must therefore be made before 
+this point. Inspired by post-training variance analysis~\cite{Papantonakis_2024}, 
+we evaluated two predictive signals during the densification phase.
+
+\textbf{SH energy} ($\|A_i B_i\|_F^2$) measures the magnitude of the learned 
+LoRA correction but depends on the learned parameters and is therefore 
+sensitive to warmup rank: under rank-2 warmup, it remains unreliable until 
+step 6000 --- past the memory peak.
+
+\textbf{Color variance} measures photometric consistency of each Gaussian 
+across training views:
 \begin{equation}
   s_i^{\text{color}} = \frac{1}{3}\left(
     \mathrm{Var}(R_i) + \mathrm{Var}(G_i) + \mathrm{Var}(B_i)
   \right)
 \end{equation}
+Each Gaussian is projected into all training images using its current 3D 
+position and SfM camera parameters; pixel colors are sampled at the projected 
+locations. Because this signal depends only on Gaussian geometry and not on 
+learned parameters, it is unaffected by warmup rank and converges to low 
+prediction error ($\sim$0.035) by step 1100, well before the memory peak 
+(Figure~\ref{fig:predictor_quality}).
+
+
 We evaluate the predictive accuracy of these signals against a step-15,000 
 full-SH3 gold standard, using GMM clustering to determine boundaries 
-automatically.
+automatically. As shown in Figure~\ref{fig:predictor_quality}, color variance 
+converges to low prediction error ($\sim$0.035) by step 1100 and remains 
+stable regardless of warmup rank, while SH energy under rank-2 warmup remains 
+unreliable until step 6000 --- past the memory peak. 
 
-\subsubsection{Experimental Setup}
-All experiments were conducted on a single NVIDIA GeForce RTX 4070 Ti (12 GB 
-VRAM) running Ubuntu 24.04.4 LTS with Python 3.12.13, PyTorch 2.11.0, CUDA 
-12.8, and gsplat 1.5.3. We evaluate on three scenes from the 
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth]{figures/predictor_quality_gmm.png}
+  \caption{Mean absolute error vs.\ gold standard (GMM, averaged across 
+  scenes). Color variance (blue/green) remains below SH energy (orange/red) 
+  at all steps, including step~0.}
+  \label{fig:predictor_quality}
+\end{figure}
+
+Figure~\ref{fig:predictor_quality} compares prediction error over training 
+steps for color variance and SH energy, evaluated under rank-2 and rank-32 
+warmups. Because color variance depends solely on Gaussian geometry, it is 
+unaffected by warmup rank and consistently outperforms SH energy. Conversely, 
+SH energy begins with large errors because the LoRA factors lack meaningful 
+initialization. While the rank-32 model recovers by step 2100, the rank-2 
+model remains volatile until step 6000, and both remain less accurate than 
+color variance. 
+
+We therefore train at rank~2 until step 4000 and run a single color variance 
+pass to establish  scene-specific quotas, minimizing memory consumption 
+through the densification phase while providing a reliable estimate before peak 
+memory is reached.
+
+%% -------------------------------------------------------
+\section{Experimental Setup}
+\label{sec:experiments}
+
+All experiments were conducted on a single NVIDIA GeForce RTX 4070 Ti 
+(12\,GB VRAM) running Ubuntu 24.04.4 LTS with Python 3.12.13, PyTorch 
+2.11.0, CUDA 12.8, and gsplat 1.5.3. We evaluate on three scenes from the 
 Ref-NeRF~\cite{refnerf} real dataset (\textit{gardenspheres}, \textit{sedan}, 
-and \textit{toycar}), downsampled by a factor of 4. Five model variants are 
-compared: LoRA Complete, LoRA Fixed, LoRA Static, SH3, and SH2. All variants 
-are trained for 15,000 steps with Gaussian densification stopped at step 
-10,000, a batch size of 1, and an SSIM loss weight of 0.2. To account for 
-variance in Gaussian initialization and densification, each variant is run 
-three times per scene, yielding 45 total training runs. Models are evaluated at 
-steps 7,000 and 15,000 using PSNR, SSIM~\cite{ssim}, and LPIPS~\cite{lpips} 
-(AlexNet).
+and \textit{toycar}), downsampled by a factor of 4. All variants are trained 
+for 15,000 steps with Gaussian densification stopped at step 10,000, a batch 
+size of 1, and an SSIM loss weight of 0.2. Each variant is run three times 
+per scene (45 total runs). Models are evaluated at steps 7,000 and 15,000 
+using PSNR, SSIM~\cite{ssim}, and LPIPS~\cite{lpips} (AlexNet).
+
+Five model variants are compared:
+\begin{itemize}[noitemsep, topsep=0pt]
+  \item \textbf{SH3} --- full degree-3 SH, no compression. Gold standard 
+  upper bound.
+  \item \textbf{SH2} --- full degree-2 SH, no compression. Low-memory 
+  baseline (15 parameters per channel).
+  \item \textbf{Static LoRA} --- uniform LoRA rank $r=16$ across all 
+  Gaussians.
+  \item \textbf{Fixed LoRA} --- dynamic routing into bins $r \in \{2, 8, 32\}$ 
+  with fixed scene-independent quotas: bottom 20\% $\to r=2$, middle 40\% 
+  $\to r=8$, top 40\% $\to r=32$. Weighted average rank: 
+  $0.2{\times}2 + 0.4{\times}8 + 0.4{\times}32 = 16.4$.
+  \item \textbf{Dynamic LoRA} --- same bins and routing as Fixed LoRA, with 
+  scene-specific quotas estimated via GMM clustering on color variance at 
+  step 4000.
+\end{itemize}
+To ensure a fair budget comparison, Static LoRA ($r=16$), Fixed LoRA, and 
+Dynamic LoRA all operate at a weighted average rank of $r_{\text{eff}} 
+\approx 16$--$16.4$.
+
+
+
+
 
 %% -------------------------------------------------------
 \begin{table*}[t]
@@ -469,24 +596,15 @@ Rot. + Scales + Opac. (Ref.) & 23.12 & 24.35 & 25.05 \\
 \label{tab:target_selection}
 \end{table}
 
-\begin{figure*}[t]
-  \centering
-  \begin{minipage}{0.48\textwidth}
-    \centering
-    \includegraphics[width=\linewidth]{figures/color_variance_fraction_gs.png}
-    \caption{Gold-standard quota fractions (SH3 at step 15,000, GMM, color 
-    variance) across seven scenes.}
-    \label{fig:scene_dep}
-  \end{minipage}\hfill
-  \begin{minipage}{0.48\textwidth}
-    \centering
-    \includegraphics[width=\linewidth]{figures/predictor_quality_gmm.png}
-    \caption{Mean absolute error vs.\ gold standard (GMM, averaged across 
-    scenes). Color variance (blue/green) remains below SH energy (orange/red) 
-    at all steps, including step~0.}
-    \label{fig:predictor_quality}
-  \end{minipage}
-\end{figure*}
+% \begin{figure}[h]
+%   \centering
+%   \includegraphics[width=\linewidth]{figures/color_variance_fraction_gs.png}
+%   \caption{Gold-standard quota fractions (SH3 at step 15,000, GMM, color 
+%   variance) across seven scenes.}
+%   \label{fig:scene_dep}
+% \end{figure}
+
+
 
 \begin{table*}[htbp]
 \centering
@@ -511,38 +629,18 @@ Rot. + Scales + Opac. (Ref.) & 23.12 & 24.35 & 25.05 \\
 \label{tab:ablation_routing}
 \end{table*}
 
-\subsection{Evaluating Heuristics for Scene-Aware Partitioning}
-Across all combinations of scoring signal and clustering method, rendering 
-quality differences were negligible (PSNR range 24.33--24.44\,dB, standard 
-deviation $\sim$1.0\,dB across three scenes). This suggests that the choice of 
-per-Gaussian scoring signal is less critical than the overall quota 
-distribution.
 
-Figure~\ref{fig:scene_dep} shows gold-standard quota fractions across seven 
-scenes using color variance. These fractions vary substantially with the 
-low-rank bucket ranging from 0.42 to 0.59, confirming that scene-independent 
-fixed quotas are ineffective and justifying scene-specific estimation.
+% Figure~\ref{fig:scene_dep} shows gold-standard quota fractions across seven 
+% scenes using color variance. These fractions vary substantially with the 
+% low-rank bucket ranging from 0.42 to 0.59, confirming that scene-independent 
+% fixed quotas are ineffective and justifying scene-specific estimation.
 
-Figure~\ref{fig:predictor_quality} compares prediction error over training 
-steps for color variance and SH energy, evaluated under rank-2 and rank-32 
-warmups. Because color variance depends solely on Gaussian geometry, it is 
-unaffected by warmup rank and consistently outperforms SH energy. Conversely, 
-SH energy begins with large errors because the LoRA factors lack meaningful 
-initialization. While the rank-32 model recovers by step 2100, the rank-2 
-model remains volatile until step 6000, and both remain less accurate than 
-color variance. We therefore train at rank~2 until step 4000 and run a single 
-color variance pass to establish scene-specific quotas. This strategy minimizes 
-memory consumption through the densification phase while providing a reliable 
-quota estimate before reaching peak memory.
+
 
 \subsection{Effective Rank Analysis and Architectural Trade-offs}
 To isolate the specific impact of our dynamic routing mechanism, we evaluate 
-our architecture against a uniformly allocated Static LoRA baseline and a 
-standard reduced-capacity SH2 baseline. To ensure a fair comparison, all models 
-operate under a roughly equivalent parameter budget: SH2 natively utilizes 
-$15$ parameters per channel, Static LoRA is fixed uniformly at $r=16$, and 
-our Dynamic LoRA averages an effective rank of $r \approx 16.4$ across the 
-population. 
+our architecture against Static LoRA and SH2 under a matched average parameter 
+budget (see Experimental Setup).
 
 By architectural definition, standard SH2 establishes the lower bound for 
 memory consumption (e.g., $4.50$\,GB on the \textit{Garden Sphere} scene). 
@@ -568,7 +666,6 @@ the system frees parameters to prioritize complex specular regions. This
 demonstrates that dynamic rank distribution is structurally superior to a 
 static uniform rank: it matches the physical topology of the scene, achieving 
 higher perceptual realism without requiring a larger global parameter budget.
-
 %% -------------------------------------------------------
 \section{Discussion}
 \label{sec:discussion}
