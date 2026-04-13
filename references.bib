@@ -7,179 +7,402 @@
 %% -------------------------------------------------------
 %% Foundational
 
-@misc{kerbl2023,
-      title={3D Gaussian Splatting for Real-Time Radiance Field Rendering}, 
-      author={Bernhard Kerbl and Georgios Kopanas and Thomas Leimkühler and George Drettakis},
-      year={2023},
-      eprint={2308.04079},
-      archivePrefix={arXiv},
-      primaryClass={cs.GR},
-      url={https://arxiv.org/abs/2308.04079}, 
+@article{kerbl2023,
+  author       = {Bernhard Kerbl and
+                  Georgios Kopanas and
+                  Thomas Leimk{\"{u}}hler and
+                  George Drettakis},
+  title        = {3D Gaussian Splatting for Real-Time Radiance Field Rendering},
+  journal      = {{ACM} Trans. Graph.},
+  volume       = {42},
+  number       = {4},
+  pages        = {139:1--139:14},
+  year         = {2023},
+  url          = {https://doi.org/10.1145/3592433},
+  doi          = {10.1145/3592433},
+  timestamp    = {Sun, 19 Jan 2025 14:38:17 +0100},
+  biburl       = {https://dblp.org/rec/journals/tog/KerblKLD23.bib},
+  bibsource    = {dblp computer science bibliography, https://dblp.org}
 }
 
-@misc{lora,
-  author    = {Edward J. Hu and Yelong Shen and Phillip Wallis and Zeyuan Allen-Zhu and
-               Yuanzhi Li and Shean Wang and Lu Wang and Weizhu Chen},
-  title     = {{LoRA}: Low-Rank Adaptation of Large Language Models},
-  booktitle = {International Conference on Learning Representations (ICLR)},
-  year      = {2022},
-  url       = {https://arxiv.org/abs/2106.09685}
+@inproceedings{lora,
+  author       = {Edward J. Hu and
+                  Yelong Shen and
+                  Phillip Wallis and
+                  Zeyuan Allen{-}Zhu and
+                  Yuanzhi Li and
+                  Shean Wang and
+                  Lu Wang and
+                  Weizhu Chen},
+  title        = {LoRA: Low-Rank Adaptation of Large Language Models},
+  booktitle    = {The Tenth International Conference on Learning Representations, {ICLR}
+                  2022, Virtual Event, April 25-29, 2022},
+  publisher    = {OpenReview.net},
+  year         = {2022},
+  url          = {https://openreview.net/forum?id=nZeVKeeFYf9},
+  timestamp    = {Sat, 20 Aug 2022 01:15:42 +0200},
+  biburl       = {https://dblp.org/rec/conf/iclr/HuSWALWWC22.bib},
+  bibsource    = {dblp computer science bibliography, https://dblp.org}
 }
 
 
 %% GS usage examples
 
-@misc{gaussianeditor,
-      title={GaussianEditor: Swift and Controllable 3D Editing with Gaussian Splatting}, 
-      author={Yiwen Chen and Zilong Chen and Chi Zhang and Feng Wang and Xiaofeng Yang and Yikai Wang and Zhongang Cai and Lei Yang and Huaping Liu and Guosheng Lin},
-      year={2023},
-      eprint={2311.14521},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2311.14521}, 
+@inproceedings{gaussianeditor,
+  author       = {Yiwen Chen and
+                  Zilong Chen and
+                  Chi Zhang and
+                  Feng Wang and
+                  Xiaofeng Yang and
+                  Yikai Wang and
+                  Zhongang Cai and
+                  Lei Yang and
+                  Huaping Liu and
+                  Guosheng Lin},
+  title        = {GaussianEditor: Swift and Controllable 3D Editing with Gaussian Splatting},
+  booktitle    = {{IEEE/CVF} Conference on Computer Vision and Pattern Recognition,
+                  {CVPR} 2024, Seattle, WA, USA, June 16-22, 2024},
+  pages        = {21476--21485},
+  publisher    = {{IEEE}},
+  year         = {2024},
+  url          = {https://doi.org/10.1109/CVPR52733.2024.02029},
+  doi          = {10.1109/CVPR52733.2024.02029},
+  timestamp    = {Fri, 13 Mar 2026 12:58:05 +0100},
+  biburl       = {https://dblp.org/rec/conf/cvpr/ChenCZWYWCYLL24.bib},
+  bibsource    = {dblp computer science bibliography, https://dblp.org}
 }
 
-@misc{avatar,
-      title={GaussianAvatars: Photorealistic Head Avatars with Rigged 3D Gaussians}, 
-      author={Shenhan Qian and Tobias Kirschstein and Liam Schoneveld and Davide Davoli and Simon Giebenhain and Matthias Nießner},
-      year={2024},
-      eprint={2312.02069},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2312.02069}, 
+@inproceedings{avatar,
+  author       = {Shenhan Qian and
+                  Tobias Kirschstein and
+                  Liam Schoneveld and
+                  Davide Davoli and
+                  Simon Giebenhain and
+                  Matthias Nie{\ss}ner},
+  title        = {GaussianAvatars: Photorealistic Head Avatars with Rigged 3D Gaussians},
+  booktitle    = {{IEEE/CVF} Conference on Computer Vision and Pattern Recognition,
+                  {CVPR} 2024, Seattle, WA, USA, June 16-22, 2024},
+  pages        = {20299--20309},
+  publisher    = {{IEEE}},
+  year         = {2024},
+  url          = {https://doi.org/10.1109/CVPR52733.2024.01919},
+  doi          = {10.1109/CVPR52733.2024.01919},
+  timestamp    = {Sun, 19 Jan 2025 13:39:05 +0100},
+  biburl       = {https://dblp.org/rec/conf/cvpr/QianKS0GN24.bib},
+  bibsource    = {dblp computer science bibliography, https://dblp.org}
 }
 
 %% -------------------------------------------------------
 %% SH memory reduction / 3DGS compression
 
 @article{Papantonakis_2024,
-   title={Reducing the Memory Footprint of 3D Gaussian Splatting},
-   volume={7},
-   ISSN={2577-6193},
-   url={http://dx.doi.org/10.1145/3651282},
-   DOI={10.1145/3651282},
-   number={1},
-   journal={Proceedings of the ACM on Computer Graphics and Interactive Techniques},
-   publisher={Association for Computing Machinery (ACM)},
-   author={Papantonakis, Panagiotis and Kopanas, Georgios and Kerbl, Bernhard and Lanvin, Alexandre and Drettakis, George},
-   year={2024},
-   month=may, pages={1–17} }
+  author       = {Panagiotis Papantonakis and
+                  Georgios Kopanas and
+                  Bernhard Kerbl and
+                  Alexandre Lanvin and
+                  George Drettakis},
+  title        = {Reducing the Memory Footprint of 3D Gaussian Splatting},
+  journal      = {Proc. {ACM} Comput. Graph. Interact. Tech.},
+  volume       = {7},
+  number       = {1},
+  pages        = {16:1--16:17},
+  year         = {2024},
+  url          = {https://doi.org/10.1145/3651282},
+  doi          = {10.1145/3651282},
+  timestamp    = {Sun, 19 Jan 2025 15:03:45 +0100},
+  biburl       = {https://dblp.org/rec/journals/pacmcgit/PapantonakisKKLD24.bib},
+  bibsource    = {dblp computer science bibliography, https://dblp.org}
+}
 
 @article{survey3dgs,
-    author = {Bagdasarian, M. T. and Knoll, P. and Li, Y. and Barthel, F. and Hilsmann, A. and Eisert, P. and Morgenstern, W.},
-    title = {3DGS.zip: A survey on 3D Gaussian Splatting Compression Methods},
-    journal = {Computer Graphics Forum},
-    volume = {44},
-    number = {2},
-    pages = {e70078},
-    year = {2025},
-    doi = {https://doi.org/10.1111/cgf.70078},
-    url = {https://onlinelibrary.wiley.com/doi/abs/10.1111/cgf.70078},
+  author       = {Milena T. Bagdasarian and
+                  Paul Knoll and
+                  Yi{-}Hsin Li and
+                  Florian Barthel and
+                  Anna Hilsmann and
+                  Peter Eisert and
+                  Wieland Morgenstern},
+  title        = {3DGS.zip: {A} survey on 3D Gaussian Splatting Compression Methods},
+  journal      = {Comput. Graph. Forum},
+  volume       = {44},
+  number       = {2},
+  year         = {2025},
+  url          = {https://doi.org/10.1111/cgf.70078},
+  doi          = {10.1111/CGF.70078},
+  timestamp    = {Sat, 06 Sep 2025 20:25:13 +0200},
+  biburl       = {https://dblp.org/rec/journals/cgf/BagdasarianKLBHEM25.bib},
+  bibsource    = {dblp computer science bibliography, https://dblp.org}
 }
 
-
-@misc{sgsplatting,
-      title={SG-Splatting: Accelerating 3D Gaussian Splatting with Spherical Gaussians}, 
-      author={Yiwen Wang and Siyuan Chen and Ran Yi},
-      year={2024},
-      eprint={2501.00342},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2501.00342}, 
+@article{sgsplatting,
+  author       = {Yiwen Wang and
+                  Siyuan Chen and
+                  Ran Yi},
+  title        = {SG-Splatting: Accelerating 3D Gaussian Splatting with Spherical Gaussians},
+  journal      = {CoRR},
+  volume       = {abs/2501.00342},
+  year         = {2025},
+  url          = {https://doi.org/10.48550/arXiv.2501.00342},
+  doi          = {10.48550/ARXIV.2501.00342},
+  eprinttype   = {arXiv},
+  eprint       = {2501.00342},
+  timestamp    = {Thu, 06 Feb 2025 20:56:58 +0100},
+  biburl       = {https://dblp.org/rec/journals/corr/abs-2501-00342.bib},
+  bibsource    = {dblp computer science bibliography, https://dblp.org}
 }
 
-@misc{megs2,
-      title={MEGS$^{2}$: Memory-Efficient Gaussian Splatting via Spherical Gaussians and Unified Pruning}, 
-      author={Jiarui Chen and Yikeng Chen and Yingshuang Zou and Ye Huang and Peng Wang and Yuan Liu and Yujing Sun and Wenping Wang},
-      year={2026},
-      eprint={2509.07021},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2509.07021}, 
+@article{megs2,
+  author       = {Jiarui Chen and
+                  Yikeng Chen and
+                  Yingshuang Zou and
+                  Ye Huang and
+                  Peng Wang and
+                  Yuan Liu and
+                  Yujing Sun and
+                  Wenping Wang},
+  title        = {MEGS\({}^{\mbox{2}}\): Memory-Efficient Gaussian Splatting via Spherical
+                  Gaussians and Unified Pruning},
+  journal      = {CoRR},
+  volume       = {abs/2509.07021},
+  year         = {2025},
+  url          = {https://doi.org/10.48550/arXiv.2509.07021},
+  doi          = {10.48550/ARXIV.2509.07021},
+  eprinttype   = {arXiv},
+  eprint       = {2509.07021},
+  timestamp    = {Sun, 12 Oct 2025 18:23:05 +0200},
+  biburl       = {https://dblp.org/rec/journals/corr/abs-2509-07021.bib},
+  bibsource    = {dblp computer science bibliography, https://dblp.org}
 }
 
 @article{lfgs,
-    title = {LFGS: A lightweight framework for efficient 3D Gaussian Splatting with minimal memory footprint},
-    journal = {Computers & Graphics},
-    volume = {131},
-    pages = {104309},
-    year = {2025},
-    issn = {0097-8493},
-    doi = {https://doi.org/10.1016/j.cag.2025.104309},
-    url = {https://www.sciencedirect.com/science/article/pii/S0097849325001505},
-    author = {Ruiqi Wu and Linlin Jiao and Gang Liu and Li Zhu and Xuan Fei and Yashuang Mu and Chao Fan},
+  author       = {Ruiqi Wu and
+                  Linlin Jiao and
+                  Gang Liu and
+                  Li Zhu and
+                  Xuan Fei and
+                  Yashuang Mu and
+                  Chao Fan},
+  title        = {{LFGS:} {A} lightweight framework for efficient 3D Gaussian Splatting
+                  with minimal memory footprint},
+  journal      = {Comput. Graph.},
+  volume       = {131},
+  pages        = {104309},
+  year         = {2025},
+  url          = {https://doi.org/10.1016/j.cag.2025.104309},
+  doi          = {10.1016/J.CAG.2025.104309},
+  timestamp    = {Sat, 06 Sep 2025 20:25:12 +0200},
+  biburl       = {https://dblp.org/rec/journals/cg/WuJLZFMF25.bib},
+  bibsource    = {dblp computer science bibliography, https://dblp.org}
 }
 
 %% -------------------------------------------------------
 %% Gaussian pruning / primitive reduction
 
 @inproceedings{minisplatting,
-  author    = {Guangchi Fang and Bing Wang},
-  title     = {Mini-Splatting: Representing the Scene with a Limited Number of Gaussians},
-  booktitle = {European Conference on Computer Vision (ECCV)},
-  year      = {2024},
-  url       = {https://arxiv.org/abs/2403.14166}
+  author       = {Guangchi Fang and
+                  Bing Wang},
+  editor       = {Ales Leonardis and
+                  Elisa Ricci and
+                  Stefan Roth and
+                  Olga Russakovsky and
+                  Torsten Sattler and
+                  G{\"{u}}l Varol},
+  title        = {Mini-Splatting: Representing Scenes with a Constrained Number of Gaussians},
+  booktitle    = {Computer Vision - {ECCV} 2024 - 18th European Conference, Milan, Italy,
+                  September 29-October 4, 2024, Proceedings, Part {LXXVII}},
+  series       = {Lecture Notes in Computer Science},
+  pages        = {165--181},
+  publisher    = {Springer},
+  year         = {2024},
+  url          = {https://doi.org/10.1007/978-3-031-72980-5\_10},
+  doi          = {10.1007/978-3-031-72980-5\_10},
+  timestamp    = {Mon, 03 Mar 2025 21:02:39 +0100},
+  biburl       = {https://dblp.org/rec/conf/eccv/FangW24.bib},
+  bibsource    = {dblp computer science bibliography, https://dblp.org}
 }
 
-@misc{lp3dgs,
-      title={Mini-Splatting: Representing Scenes with a Constrained Number of Gaussians}, 
-      author={Guangchi Fang and Bing Wang},
-      year={2024},
-      eprint={2403.14166},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2403.14166}, 
+@inproceedings{lp3dgs,
+  author       = {Zhaoliang Zhang and
+                  Tianchen Song and
+                  Yongjae Lee and
+                  Li Yang and
+                  Cheng Peng and
+                  Rama Chellappa and
+                  Deliang Fan},
+  editor       = {Amir Globersons and
+                  Lester Mackey and
+                  Danielle Belgrave and
+                  Angela Fan and
+                  Ulrich Paquet and
+                  Jakub M. Tomczak and
+                  Cheng Zhang},
+  title        = {{LP-3DGS:} Learning to Prune 3D Gaussian Splatting},
+  booktitle    = {Advances in Neural Information Processing Systems 38: Annual Conference
+                  on Neural Information Processing Systems 2024, NeurIPS 2024, Vancouver,
+                  BC, Canada, December 10 - 15, 2024},
+  year         = {2024},
+  url          = {http://papers.nips.cc/paper\_files/paper/2024/hash/dd51dbce305433cd60910dc5b0147be4-Abstract-Conference.html},
+  timestamp    = {Thu, 13 Feb 2025 16:56:45 +0100},
+  biburl       = {https://dblp.org/rec/conf/nips/ZhangSL00CF24.bib},
+  bibsource    = {dblp computer science bibliography, https://dblp.org}
 }
 
 %% -------------------------------------------------------
 %% LoRA in 3DGS ecosystem
 
-@misc{lr4dgstream,
-      title={Efficient 4D Gaussian Stream with Low Rank Adaptation}, 
-      author={Zhenhuan Liu and Shuai Liu and Yidong Lu and Yirui Chen and Jie Yang and Wei Liu},
-      year={2025},
-      eprint={2502.16575},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2502.16575}, 
+@article{lr4dgstream,
+  author       = {Zhenhuan Liu and
+                  Shuai Liu and
+                  Yidong Lu and
+                  Yirui Chen and
+                  Jie Yang and
+                  Wei Liu},
+  title        = {Efficient 4D Gaussian Stream with Low Rank Adaptation},
+  journal      = {CoRR},
+  volume       = {abs/2502.16575},
+  year         = {2025},
+  url          = {https://doi.org/10.48550/arXiv.2502.16575},
+  doi          = {10.48550/ARXIV.2502.16575},
+  eprinttype   = {arXiv},
+  eprint       = {2502.16575},
+  timestamp    = {Thu, 20 Mar 2025 13:28:48 +0100},
+  biburl       = {https://dblp.org/rec/journals/corr/abs-2502-16575.bib},
+  bibsource    = {dblp computer science bibliography, https://dblp.org}
+}
+@article{ufvsplatter,
+  author       = {Yuki Fujimura and
+                  Takahiro Kushida and
+                  Kazuya Kitano and
+                  Takuya Funatomi and
+                  Yasuhiro Mukaigawa},
+  title        = {UFV-Splatter: Pose-Free Feed-Forward 3D Gaussian Splatting Adapted
+                  to Unfavorable Views},
+  journal      = {CoRR},
+  volume       = {abs/2507.22342},
+  year         = {2025},
+  url          = {https://doi.org/10.48550/arXiv.2507.22342},
+  doi          = {10.48550/ARXIV.2507.22342},
+  eprinttype   = {arXiv},
+  eprint       = {2507.22342},
+  timestamp    = {Thu, 21 Aug 2025 15:51:49 +0200},
+  biburl       = {https://dblp.org/rec/journals/corr/abs-2507-22342.bib},
+  bibsource    = {dblp computer science bibliography, https://dblp.org}
 }
 
-@misc{ufvsplatter,
-      title={UFV-Splatter: Pose-Free Feed-Forward 3D Gaussian Splatting Adapted to Unfavorable Views}, 
-      author={Yuki Fujimura and Takahiro Kushida and Kazuya Kitano and Takuya Funatomi and Yasuhiro Mukaigawa},
-      year={2025},
-      eprint={2507.22342},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2507.22342}, 
+@article{stylesplat,
+  author       = {Sahil Jain and
+                  Avik Kuthiala and
+                  Prabhdeep Singh Sethi and
+                  Prakanshul Saxena},
+  title        = {StyleSplat: 3D Object Style Transfer with Gaussian Splatting},
+  journal      = {CoRR},
+  volume       = {abs/2407.09473},
+  year         = {2024},
+  url          = {https://doi.org/10.48550/arXiv.2407.09473},
+  doi          = {10.48550/ARXIV.2407.09473},
+  eprinttype   = {arXiv},
+  eprint       = {2407.09473},
+  timestamp    = {Thu, 15 Aug 2024 11:20:56 +0200},
+  biburl       = {https://dblp.org/rec/journals/corr/abs-2407-09473.bib},
+  bibsource    = {dblp computer science bibliography, https://dblp.org}
 }
 
-@misc{stylesplat,
-      title={StyleSplat: 3D Object Style Transfer with Gaussian Splatting}, 
-      author={Sahil Jain and Avik Kuthiala and Prabhdeep Singh Sethi and Prakanshul Saxena},
-      year={2024},
-      eprint={2407.09473},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2407.09473}, 
+@inproceedings{adalora,
+  author       = {Qingru Zhang and
+                  Minshuo Chen and
+                  Alexander Bukharin and
+                  Pengcheng He and
+                  Yu Cheng and
+                  Weizhu Chen and
+                  Tuo Zhao},
+  title        = {Adaptive Budget Allocation for Parameter-Efficient Fine-Tuning},
+  booktitle    = {The Eleventh International Conference on Learning Representations,
+                  {ICLR} 2023, Kigali, Rwanda, May 1-5, 2023},
+  publisher    = {OpenReview.net},
+  year         = {2023},
+  url          = {https://openreview.net/forum?id=lq62uWRJjiY},
+  timestamp    = {Wed, 24 Jul 2024 16:50:34 +0200},
+  biburl       = {https://dblp.org/rec/conf/iclr/ZhangCBH0CZ23.bib},
+  bibsource    = {dblp computer science bibliography, https://dblp.org}
 }
 
-@misc{adalora,
-      title={AdaLoRA: Adaptive Budget Allocation for Parameter-Efficient Fine-Tuning}, 
-      author={Qingru Zhang and Minshuo Chen and Alexander Bukharin and Nikos Karampatziakis and Pengcheng He and Yu Cheng and Weizhu Chen and Tuo Zhao},
-      year={2023},
-      eprint={2303.10512},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2303.10512}, 
+@inproceedings{taming3dgs,
+  author       = {Saswat Subhajyoti Mallick and
+                  Rahul Goel and
+                  Bernhard Kerbl and
+                  Markus Steinberger and
+                  Francisco Vicente Carrasco and
+                  Fernando De la Torre},
+  editor       = {Takeo Igarashi and
+                  Ariel Shamir and
+                  Hao (Richard) Zhang},
+  title        = {Taming 3DGS: High-Quality Radiance Fields with Limited Resources},
+  booktitle    = {{SIGGRAPH} Asia 2024 Conference Papers, {SA} 2024, Tokyo, Japan, December
+                  3-6, 2024},
+  pages        = {2:1--2:11},
+  publisher    = {{ACM}},
+  year         = {2024},
+  url          = {https://doi.org/10.1145/3680528.3687694},
+  doi          = {10.1145/3680528.3687694},
+  timestamp    = {Sun, 22 Dec 2024 15:48:07 +0100},
+  biburl       = {https://dblp.org/rec/conf/siggrapha/MallickGKS0T24.bib},
+  bibsource    = {dblp computer science bibliography, https://dblp.org}
 }
 
-@misc{taming3dgs,
-      title={Taming 3DGS: High-Quality Radiance Fields with Limited Resources}, 
-      author={Saswat Subhajyoti Mallick and Rahul Goel and Bernhard Kerbl and Francisco Vicente Carrasco and Markus Steinberger and Fernando De La Torre},
-      year={2024},
-      eprint={2406.15643},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2406.15643}, 
+@inproceedings{refnerf,
+  author       = {Dor Verbin and
+                  Peter Hedman and
+                  Ben Mildenhall and
+                  Todd E. Zickler and
+                  Jonathan T. Barron and
+                  Pratul P. Srinivasan},
+  title        = {Ref-NeRF: Structured View-Dependent Appearance for Neural Radiance
+                  Fields},
+  booktitle    = {{IEEE/CVF} Conference on Computer Vision and Pattern Recognition,
+                  {CVPR} 2022, New Orleans, LA, USA, June 18-24, 2022},
+  pages        = {5481--5490},
+  publisher    = {{IEEE}},
+  year         = {2022},
+  url          = {https://doi.org/10.1109/CVPR52688.2022.00541},
+  doi          = {10.1109/CVPR52688.2022.00541},
+  timestamp    = {Sun, 19 Jan 2025 13:39:04 +0100},
+  biburl       = {https://dblp.org/rec/conf/cvpr/VerbinHMZBS22.bib},
+  bibsource    = {dblp computer science bibliography, https://dblp.org}
+}
+
+@inproceedings{lpips,
+  author       = {Richard Zhang and
+                  Phillip Isola and
+                  Alexei A. Efros and
+                  Eli Shechtman and
+                  Oliver Wang},
+  title        = {The Unreasonable Effectiveness of Deep Features as a Perceptual Metric},
+  booktitle    = {2018 {IEEE} Conference on Computer Vision and Pattern Recognition,
+                  {CVPR} 2018, Salt Lake City, UT, USA, June 18-22, 2018},
+  pages        = {586--595},
+  publisher    = {Computer Vision Foundation / {IEEE} Computer Society},
+  year         = {2018},
+  url          = {http://openaccess.thecvf.com/content\_cvpr\_2018/html/Zhang\_The\_Unreasonable\_Effectiveness\_CVPR\_2018\_paper.html},
+  doi          = {10.1109/CVPR.2018.00068},
+  timestamp    = {Fri, 24 Mar 2023 00:02:56 +0100},
+  biburl       = {https://dblp.org/rec/conf/cvpr/ZhangIESW18.bib},
+  bibsource    = {dblp computer science bibliography, https://dblp.org}
+}
+
+@article{ssim,
+  author       = {Zhou Wang and
+                  Alan C. Bovik and
+                  Hamid R. Sheikh and
+                  Eero P. Simoncelli},
+  title        = {Image quality assessment: from error visibility to structural similarity},
+  journal      = {{IEEE} Trans. Image Process.},
+  volume       = {13},
+  number       = {4},
+  pages        = {600--612},
+  year         = {2004},
+  url          = {https://doi.org/10.1109/TIP.2003.819861},
+  doi          = {10.1109/TIP.2003.819861},
+  timestamp    = {Fri, 30 Jul 2021 13:45:25 +0200},
+  biburl       = {https://dblp.org/rec/journals/tip/WangBSS04.bib},
+  bibsource    = {dblp computer science bibliography, https://dblp.org}
 }
