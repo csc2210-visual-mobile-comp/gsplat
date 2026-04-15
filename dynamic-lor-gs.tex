@@ -118,8 +118,8 @@ majority of this parameter budget is consumed by the higher-order Spherical
 Harmonic (SH) coefficients, which are necessary to model complex, 
 view-dependent color phenomena such as reflections and specular highlights. 
 
-Existing mitigation strategies either operate post-training --- leaving peak 
-VRAM unaffected --- or apply uniform constraints that fail to account for the 
+Existing mitigation strategies either operate post-training, which leaves peak 
+VRAM unaffected, or apply uniform constraints that fail to account for the 
 physical heterogeneity of real-world scenes. 
 A matte wall requires minimal view-dependent capacity, 
 whereas a glossy car window requires precise, high-frequency parameterization. 
@@ -272,8 +272,8 @@ high-frequency perceptual quality of the rendered scene.
 \label{sec:method}
 
 \subsection{Isolating the Memory Bottleneck}
-Our initial idea was to apply LoRA to any subset of Gaussian attributes ---
-colors, rotations, scales, or opacities --- to directly reduce the parameter
+Our initial idea was to apply LoRA to any subset of Gaussian attributes (i.e.
+colors, rotations, scales, or opacities) to directly reduce the parameter
 budget during training, while leaving all remaining attributes full-rank.
 Let $G \in \mathbb{R}^{N \times D}$ denote the full attribute matrix, where
 each row $g^{(i)} \in \mathbb{R}^{D}$ is the attribute vector of Gaussian $i$
@@ -409,8 +409,8 @@ numerical quotas (e.g.\ 100K Gaussians to $r=2$, 200K to $r=8$, remainder to
 $r=32$), which allow static tensor pre-allocation. However, both fixed and
 percentile routing share a ``materialization cost'' floor, negating this
 advantage. We therefore use percentile quotas $(q_{\text{top}}, q_{\text{mid}},
-q_{\text{bot}})$ --- e.g.\ $(0.4, 0.4, 0.2)$ for the high-, mid-, and
-low-rank bins respectively --- which scale natively with the evolving geometry
+q_{\text{bot}})$ (e.g.\ $(0.4, 0.4, 0.2)$ for the high-, mid-, and
+low-rank bins respectively), which scale natively with the evolving geometry
 as densification grows $N$. We refer to this method as \textbf{Fixed Percentile LoRA}.
 
 \subsubsection{Scene Analysis for Relative Thresholding}
@@ -537,7 +537,7 @@ Toycar & SH3 (Gold Standard) & 3.42 $\pm$ 0.00 & \textbf{24.819 $\pm$ 0.005} & \
 \begin{figure*}[t]
 \centering
 \includegraphics[width=\textwidth]{figures/render.png}
-\caption{\textbf{Qualitative Evaluation and Dynamic Rank Distribution on the \textit{Garden Sphere} Scene.} (Left to right: Ground Truth, SH3 Baseline, Dynamic LoRA (Ours), Dynamic Rank Heatmap). Our Dynamic LoRA architecture achieves perceptual parity with the unconstrained SH3 baseline, preserving high-frequency details and specular reflections. The rank heatmap visualizes our dynamic allocation strategy: the system constrains diffuse backgrounds to a minimal capacity ($r_{\min}$, blue), allocates moderate capacity to structural edges ($r_{\text{mid}}$, purple), and concentrates its maximum parameter budget on complex, view-dependent specularities ($r_{\max}$, red). This demonstrates that our routing mechanism actively learns and exploits the physical topology of the scene.}
+\caption{\textbf{Qualitative Evaluation and Dynamic Rank Distribution on the \textit{Sedan} Scene.} (Left to right: Ground Truth, SH3 Baseline, Dynamic LoRA (Ours), Dynamic Rank Heatmap). Our Dynamic LoRA architecture achieves perceptual parity with the unconstrained SH3 baseline, preserving high-frequency details and specular reflections. The rank heatmap visualizes our dynamic allocation strategy: the system constrains diffuse backgrounds to a minimal capacity ($r_{\min}$, blue), allocates moderate capacity to structural edges ($r_{\text{mid}}$, purple), and concentrates its maximum parameter budget on complex, view-dependent textures ($r_{\max}$, red). This demonstrates that our routing mechanism actively learns and exploits the physical topology of the scene.}
 \label{fig:qualitative_garden}
 \end{figure*}
 
